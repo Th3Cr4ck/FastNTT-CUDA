@@ -2,11 +2,11 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-#define Q  193
+#define Q  12289
 
-double diff_ns(struct timespec a, struct timespec b) {
-    return (b.tv_sec  - a.tv_sec)  * 1e9 +
-           (b.tv_nsec - a.tv_nsec);
+double diff_us(struct timespec a, struct timespec b) {
+    return (b.tv_sec  - a.tv_sec)  * 1e6 +
+           (b.tv_nsec - a.tv_nsec) / 1e3;
 }
 
 long power(long base, long exp, int mod) {
@@ -97,15 +97,15 @@ int main() {
 
     srand(time(NULL));
 
-    int Ns[] = {2, 4, 8, 16, 32, 64};
+    int Ns[] = {128, 256, 512, 1024, 2048, 4096};
     int num_sizes = sizeof(Ns) / sizeof(Ns[0]);
     int pruebas = 50;
 
     for (int s = 0; s < num_sizes; s++) {
 
         int N = Ns[s];
-		int g = 5;
-		int w = power(g, 192/N, Q);
+		int g = 11;
+		int w = power(g, (Q-1)/N, Q);
 
         int*  a      = malloc(sizeof(int)  * N);
         long* A_fast = malloc(sizeof(long) * N);
@@ -123,12 +123,12 @@ int main() {
             clock_gettime(CLOCK_MONOTONIC, &t0);
             FastNTT_ciclica_secuencial(A_fast, a, N, w, Q);
             clock_gettime(CLOCK_MONOTONIC, &t1);
-            tiempo_fast += diff_ns(t0, t1);
+            tiempo_fast += diff_us(t0, t1);
 
             clock_gettime(CLOCK_MONOTONIC, &t0);
             NTT_ciclica_secuencial(A_ref, a, N, w, Q);
             clock_gettime(CLOCK_MONOTONIC, &t1);
-            tiempo_ref += diff_ns(t0, t1);
+            tiempo_ref += diff_us(t0, t1);
 
             if (!comparar(A_fast, A_ref, N)) {
                 printf("❌ Error detectado para N = %d\n", N);
@@ -137,8 +137,8 @@ int main() {
         }
 
         printf("\nN = %d\n", N);
-        printf("FastNTT   promedio: %.0f ns\n", tiempo_fast / pruebas);
-        printf("NTT lenta promedio: %.0f ns\n", tiempo_ref  / pruebas);
+        printf("FastNTT   promedio: %.0lf us\n", tiempo_fast / pruebas);
+        printf("NTT lenta promedio: %.0lf us\n", tiempo_ref  / pruebas);
         printf("Speedup: %.2fx\n",
                tiempo_ref / tiempo_fast);
 

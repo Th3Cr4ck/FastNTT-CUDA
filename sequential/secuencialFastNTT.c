@@ -4,9 +4,9 @@
 #include <math.h>
 #include <time.h>
 
-#define Q_DEF	17
-#define N_DEF	8
-#define W_POS	9
+#define Q_DEF	3329
+#define N_DEF	256
+#define W_POS	939
 
 long power(long base, long exp, int mod) {
     long res = 1;
@@ -38,8 +38,6 @@ void FastNTT_ciclica_secuencial(long* A, int* a, int N, int w, int q) {
 	long* E = (long*)malloc(sizeof(long) * N/2);
 	long* O = (long*)malloc(sizeof(long) * N/2);
 	
-	// int pares[N/2];
-	// int impares[N/2];
 	int* pares = (int*)malloc(sizeof(int) * N/2);
 	int* impares = (int*)malloc(sizeof(int) * N/2);
 	
@@ -99,7 +97,6 @@ int main(int argc, char* argv[]) {
 	struct timespec inicio, fin;
 	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &inicio);
 
-	// Fast-NTT ciclica
 	FastNTT_ciclica_secuencial(A, a, N_DEF, W_POS, Q_DEF);
 
 	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &fin);

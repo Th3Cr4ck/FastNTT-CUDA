@@ -4,9 +4,9 @@
 #include <math.h>
 #include <time.h>
 
-#define Q_DEF	17
-#define N_DEF	8
-#define W_POS	9
+#define Q_DEF	3329
+#define N_DEF	256
+#define W_POS	939
 
 long power(long base, long exp, int mod) {
     long res = 1;
@@ -65,7 +65,6 @@ int main(int argc, char* argv[]) {
 	struct timespec inicio, fin;
 	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &inicio);
 
-	// NTT ciclica
 	NTT_ciclica_secuencial(A, a, N_DEF, W_POS, Q_DEF);
 
 	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &fin);
