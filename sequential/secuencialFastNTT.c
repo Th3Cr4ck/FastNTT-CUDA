@@ -5,8 +5,8 @@
 #include <time.h>
 
 #define Q_DEF	3329
-#define N_DEF	256
-#define W_POS	939
+#define N_DEF	8
+#define W_POS	749
 
 long power(long base, long exp, int mod) {
     long res = 1;
@@ -87,12 +87,12 @@ int main(int argc, char* argv[]) {
 	long A[N_DEF];
 	int a[N_DEF];
 
-	for (int i = 0; i < N_DEF/2; i++) {
+	for (int i = 0; i < N_DEF; i++) {
 		a[i] = i;
-		a[N_DEF-i-1] = i;
 	}
 
 	imprimir_arreglo((void*)a, sizeof(int), N_DEF);
+	puts("");
 
 	struct timespec inicio, fin;
 	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &inicio);
@@ -104,6 +104,7 @@ int main(int argc, char* argv[]) {
 	double nanosegundos = fin.tv_nsec - inicio.tv_nsec;
 
 	imprimir_arreglo((void*)A, sizeof(long), N_DEF);
+	puts("");
 
 	printf("El algoritmo secuencial Fast-NTT tardó: %.2lf ns\n", nanosegundos);
 

@@ -69,7 +69,7 @@ void FastNTT_ciclica_secuencial(long* A, int* a, int N, int w, int q) {
 		if (temp < 0) temp += q;
 		A[k+N/2] = temp;
 
-		twiddle = (twiddle * wstep) % q;
+		twiddle = (twiddle * wstep) % q; //w^k
 	}
 
 	free(pares);
@@ -99,7 +99,7 @@ int main() {
 
     int Ns[] = {128, 256, 512, 1024, 2048, 4096};
     int num_sizes = sizeof(Ns) / sizeof(Ns[0]);
-    int pruebas = 50;
+    int pruebas = 10;
 
     for (int s = 0; s < num_sizes; s++) {
 
