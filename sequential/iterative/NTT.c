@@ -37,6 +37,23 @@ void NTT_ciclica_secuencial(uint64_t* A, uint32_t* a, uint32_t N, uint32_t w, ui
 	}
 }
 
+void INTT_ciclica_secuencial(uint64_t* A, uint32_t* a, uint32_t N, uint32_t w, uint32_t q) {
+	uint32_t w_inv = power(w, q-2, q);
+    uint32_t N_inv = power(N, q-2, q);
+
+    for (uint32_t n = 0; n < N; n++) {
+        uint64_t acc = 0;
+
+        for (uint32_t k = 0; k < N; k++) {
+            uint32_t exp = (uint64_t)n * k % (q-1);
+            uint32_t tw  = power(w_inv, exp, q);
+            acc = (acc + (uint64_t)A[k] * tw) % q;
+        }
+
+        a[n] = (uint64_t)acc * N_inv % q;
+    }
+}
+
 void imprimir_arreglo(void* arreglo, size_t size, uint32_t tamanio) {
     for (uint32_t i = 0; i < tamanio; i++) {
         if (size == sizeof(uint32_t)) {
@@ -62,17 +79,18 @@ int main(uint32_t argc, char* argv[]) {
 	puts("");
 
 	struct timespec inicio, fin;
+
 	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &inicio);
-
 	NTT_ciclica_secuencial(A, a, N_DEF, W_POS, Q_DEF);
-
 	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &fin);
-
-	double nanosegundos = fin.tv_nsec - inicio.tv_nsec;
 
 	imprimir_arreglo((void*)A, sizeof(uint64_t), N_DEF);
 	puts("");
+	
+	imprimir_arreglo((void*)a, sizeof(uint32_t), N_DEF);
+	puts("");
 
+	double nanosegundos = fin.tv_nsec - inicio.tv_nsec;
 	printf("El algoritmo secuencial NTT tardó: %.2lf ns\n", nanosegundos);
 
 	return 0;

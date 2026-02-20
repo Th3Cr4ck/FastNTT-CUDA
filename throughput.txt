@@ -1,0 +1,4 @@
+MemoryClockRate = 3004 MHz
+MemoryBusWidth = 64-bit
+
+(3004x10^6)x(64/8)/10^9 = 24.032 GB/sec

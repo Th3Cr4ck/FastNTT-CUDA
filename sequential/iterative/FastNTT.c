@@ -3,9 +3,14 @@
 #include <time.h>
 #include <stdint.h>
 
-#define Q_DEF	3329
-#define N_DEF	8
-#define W_POS	749
+#define Q 998244353
+#define G 3
+#define Q_DEF	Q
+#define N_DEF	512
+// #define W_POS	749
+// #define Q_DEF	3329
+// #define N_DEF	8
+// #define W_POS	749
 
 uint64_t power(uint64_t base, uint64_t exp, uint32_t mod) {
     uint64_t res = 1;
@@ -32,27 +37,27 @@ void FastNTT_ciclica_iterativa(uint64_t* A, uint32_t* a, uint32_t N, uint32_t w,
     for (uint32_t i = 0; i < N; i++)
         A[i] = a[i];
 
-    /* // --- Bit-reversal permutation ---
-    uint32_t j = 0;
-    for (uint32_t i = 1; i < N; i++) {
-        uint32_t bit = N >> 1;
-        while (j & bit) {
-            j ^= bit;
-            bit >>= 1;
-        }
-        j |= bit;
-
-        if (i < j) {
-            uint64_t temp = A[i];
-            A[i] = A[j];
-            A[j] = temp;
-        }
-    } */
+    // // --- Bit-reversal permutation ---
+    // uint32_t j = 0;
+    // for (uint32_t i = 1; i < N; i++) {
+    //     uint32_t bit = N >> 1;
+    //     while (j & bit) {
+    //         j ^= bit;
+    //         bit >>= 1;
+    //     }
+    //     j |= bit;
+    //
+    //     if (i < j) {
+    //         uint64_t temp = A[i];
+    //         A[i] = A[j];
+    //         A[j] = temp;
+    //     }
+    // }
 
     // --- Etapas ---
     for (uint32_t len = 2; len <= N; len <<= 1) {
 
-        uint64_t wlen = power(w, (N_DEF / len), q);  // raíz para esta etapa
+        uint64_t wlen = power(w, (N / len), q);  // raíz para esta etapa
 
         for (uint32_t i = 0; i < N; i += len) {
 
@@ -86,7 +91,7 @@ void FastINTT_ciclica_iterativa(uint64_t* A,
     // Etapas (DIF: empezamos desde N y vamos bajando)
     for (uint32_t len = N; len >= 2; len >>= 1) {
 
-        uint64_t wlen = power(w_inv, N_DEF / len, q);
+        uint64_t wlen = power(w_inv, N / len, q);
 
         for (uint32_t i = 0; i < N; i += len) {
 
@@ -143,11 +148,11 @@ int main(uint32_t argc, char* argv[]) {
 	imprimir_arreglo((void*)a, sizeof(uint32_t), N_DEF);
 	puts("");
 
+    uint32_t w = power(G, (Q-1)/N_DEF, Q); // Added
 	struct timespec inicio, fin;
+
 	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &inicio);
-
-	FastNTT_ciclica_iterativa(A, a, N_DEF, W_POS, Q_DEF);
-
+	FastNTT_ciclica_iterativa(A, a, N_DEF, w, Q_DEF);
 	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &fin);
 
 	double nanosegundos = fin.tv_nsec - inicio.tv_nsec;
@@ -155,7 +160,7 @@ int main(uint32_t argc, char* argv[]) {
 	imprimir_arreglo((void*)A, sizeof(uint64_t), N_DEF);
 	puts("");
 
-	FastINTT_ciclica_iterativa(A, N_DEF, W_POS, Q_DEF);
+	FastINTT_ciclica_iterativa(A, N_DEF, w, Q_DEF);
 	imprimir_arreglo((void*)A, sizeof(uint64_t), N_DEF);
 	puts("");
 
