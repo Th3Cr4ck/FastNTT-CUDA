@@ -170,8 +170,8 @@ int main()
 
         uint64_t w = power(G, (Q-1)/N, Q);
 
-        uint32_t threads = N/2;      // single-block strategy
-        uint32_t blocks  = 1;
+        uint32_t threads = N/2;       
+		uint32_t blocks  = 1;
 
         printf("threads=%u blocks=%u\n", threads, blocks);
 
@@ -213,14 +213,13 @@ int main()
         // =====================================================
         double total_time_s = ms / 1000.0;
         double avg_time_s   = total_time_s / runs;
-        double tps          = 1.0 / avg_time_s;
+        // double tps          = 1.0 / avg_time_s;
 
         // throughput estimado
         double bytes = 16.0 * N * log2((double)N);
         double throughput = bytes / (avg_time_s * 1e9);
 
         printf("Tiempo promedio por NTT: %.6e s\n", avg_time_s);
-        printf("Transformadas/s: %.2f\n", tps);
         printf("Throughput efectivo (estimado): %.3f GB/s\n", throughput);
 
         // =====================================================

@@ -24,16 +24,25 @@ uint64_t power(uint64_t base, uint64_t exp, uint32_t mod) {
 }
 
 __global__
-void fastNTT_simple(uint64_t *d_A, uint32_t N, uint32_t len, uint32_t w, uint32_t q)
+void fastNTT_simple(
+		uint64_t *d_A, 
+		uint32_t N, 
+		uint32_t len, 
+		uint32_t w, 
+		uint32_t q)
 {
+	// *d_A -> Arreglo de entrada 
+	// N -> Tamaño de d_A
+	// len -> Tamaño de un bloque lógico 
+	
 	int tid = blockDim.x * blockIdx.x + threadIdx.x;
 	if (tid >= N/2) return; // Salir si se lanzan mas de N/2 threads
 
-	uint32_t midlen = len/2;
+	uint32_t midlen = len/2; // Número de butterflies por bloque logico
 
-	uint32_t block = tid / midlen;
-	uint32_t k = tid % midlen;
-	uint32_t i = block * len;
+	uint32_t block = tid / midlen;	// A qué bloque lógico corresponde el thread
+	uint32_t k = tid % midlen;		// Índice del thread dentro del bloque lógico
+	uint32_t i = block * len;		// Índice base general del bloque lógico en A
 	
 	// Lectura entradas Butterfly
 	uint64_t u = d_A[i + k];
@@ -101,7 +110,7 @@ int main()
 	cudaMemcpy(d_A, A, sizeof(uint64_t)*N_DEF, cudaMemcpyHostToDevice);
 
 	uint32_t threads = N_DEF / 2;
-	uint32_t blockSize = N_DEF;
+	uint32_t size = N_DEF;
 	uint32_t gridSize = 1;
 	
     uint32_t w = power(G, (Q-1)/N_DEF, Q);
@@ -114,15 +123,15 @@ int main()
 	cudaEventRecord(start);
 
 	// Realizar NTT
-	fastNTT_simple<<<1,threads>>>(d_A, blockSize, 2, w, Q);
-	fastNTT_simple<<<1,threads>>>(d_A, blockSize, 4, w, Q);
-	fastNTT_simple<<<1,threads>>>(d_A, blockSize, 8, w, Q);
-	fastNTT_simple<<<1,threads>>>(d_A, blockSize, 16, w, Q);
-	fastNTT_simple<<<1,threads>>>(d_A, blockSize, 32, w, Q);
-	fastNTT_simple<<<1,threads>>>(d_A, blockSize, 64, w, Q);
-	fastNTT_simple<<<1,threads>>>(d_A, blockSize, 128, w, Q);
-	fastNTT_simple<<<1,threads>>>(d_A, blockSize, 256, w, Q);
-	fastNTT_simple<<<1,threads>>>(d_A, blockSize, 512, w, Q);
+	fastNTT_simple<<<1,threads>>>(d_A, size, 2, w, Q);
+	fastNTT_simple<<<1,threads>>>(d_A, size, 4, w, Q);
+	fastNTT_simple<<<1,threads>>>(d_A, size, 8, w, Q);
+	fastNTT_simple<<<1,threads>>>(d_A, size, 16, w, Q);
+	fastNTT_simple<<<1,threads>>>(d_A, size, 32, w, Q);
+	fastNTT_simple<<<1,threads>>>(d_A, size, 64, w, Q);
+	fastNTT_simple<<<1,threads>>>(d_A, size, 128, w, Q);
+	fastNTT_simple<<<1,threads>>>(d_A, size, 256, w, Q);
+	fastNTT_simple<<<1,threads>>>(d_A, size, 512, w, Q);
 
 	cudaEventRecord(stop);
 	cudaEventSynchronize(stop);
@@ -135,15 +144,15 @@ int main()
 
 	// Realizar INTT
 	uint32_t w_inv = power(w, Q-2, Q);
-	fastINTT_simple<<<1,threads>>>(d_A,  blockSize, 512, w_inv, Q);
-	fastINTT_simple<<<1,threads>>>(d_A,  blockSize, 256, w_inv, Q);
-	fastINTT_simple<<<1,threads>>>(d_A,  blockSize, 128, w_inv, Q);
-	fastINTT_simple<<<1,threads>>>(d_A,  blockSize, 64, w_inv, Q);
-	fastINTT_simple<<<1,threads>>>(d_A,  blockSize, 32, w_inv, Q);
-	fastINTT_simple<<<1,threads>>>(d_A,  blockSize, 16, w_inv, Q);
-	fastINTT_simple<<<1,threads>>>(d_A,  blockSize, 8, w_inv, Q);
-	fastINTT_simple<<<1,threads>>>(d_A,  blockSize, 4, w_inv, Q);
-	fastINTT_simple<<<1,threads>>>(d_A,  blockSize, 2, w_inv, Q);
+	fastINTT_simple<<<1,threads>>>(d_A,  size, 512, w_inv, Q);
+	fastINTT_simple<<<1,threads>>>(d_A,  size, 256, w_inv, Q);
+	fastINTT_simple<<<1,threads>>>(d_A,  size, 128, w_inv, Q);
+	fastINTT_simple<<<1,threads>>>(d_A,  size, 64, w_inv, Q);
+	fastINTT_simple<<<1,threads>>>(d_A,  size, 32, w_inv, Q);
+	fastINTT_simple<<<1,threads>>>(d_A,  size, 16, w_inv, Q);
+	fastINTT_simple<<<1,threads>>>(d_A,  size, 8, w_inv, Q);
+	fastINTT_simple<<<1,threads>>>(d_A,  size, 4, w_inv, Q);
+	fastINTT_simple<<<1,threads>>>(d_A,  size, 2, w_inv, Q);
 	
 	// Copiar los datos de salida de la memoria global del GPU
 	cudaMemcpy(A, d_A, sizeof(uint64_t)*N_DEF, cudaMemcpyDeviceToHost);
