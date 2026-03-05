@@ -135,20 +135,19 @@ __global__ void intt_kernel(uint64_t *d_A, const uint64_t *twiddles_inv,
       uint64_t u = d_A[pos];
       uint64_t v = d_A[pos + len];
 
-      uint64_t w = twiddles_inv[stage_offsets[stage] + j];
-
-      uint64_t t = (v * w) % Q;
-
-      uint64_t sum = u + t;
+      uint64_t sum = u + v;
       if (sum >= Q)
         sum -= Q;
 
-      uint64_t diff = u + Q - t;
+      uint64_t diff = u + Q - v;
       if (diff >= Q)
         diff -= Q;
 
+      uint64_t w = twiddles_inv[stage_offsets[stage] + j];
+      uint64_t t = (diff * w) % Q;
+
       d_A[pos] = sum;
-      d_A[pos + len] = diff;
+      d_A[pos + len] = t;
     }
 
     __syncthreads();
