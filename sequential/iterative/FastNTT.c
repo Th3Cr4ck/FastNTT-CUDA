@@ -136,7 +136,7 @@ void imprimir_arreglo(void* arreglo, size_t size, uint32_t tamanio) {
     printf("\n");
 }
 
-int main(uint32_t argc, char* argv[]) {
+int main(int argc, char* argv[]) {
 
 	uint64_t A[N_DEF];
 	uint32_t a[N_DEF];
