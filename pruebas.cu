@@ -58,37 +58,33 @@ __global__ void ntt_kernel(uint32_t *d_A, const uint32_t n,
 
   for (uint32_t len = 1; len < n; len <<= 1) {
 
-    uint32_t butterflies = n >> 1;
+    uint32_t b = tid;
 
-    for (uint32_t b = tid; b < butterflies; b += blockDim.x) {
+    // cada butterfly tiene:
+    uint32_t group =
+        b / len;          // A qué bloque (grupo) lógico corresponde el thread
+    uint32_t j = b % len; // Índice del thread dentro del bloque lógico
 
-      // cada butterfly tiene:
-      uint32_t group =
-          b / len; // A qué bloque (grupo) lógico corresponde el thread
-      uint32_t j = b % len; // Índice del thread dentro del bloque lógico
+    uint32_t base = group * (2 * len); // Índice base del bloque (grupo) lógico
+    uint32_t pos = base + j;
 
-      uint32_t base =
-          group * (2 * len); // Índice base del bloque (grupo) lógico
-      uint32_t pos = base + j;
+    uint32_t u = d_A[pos];
+    uint32_t v = d_A[pos + len];
 
-      uint32_t u = d_A[pos];
-      uint32_t v = d_A[pos + len];
+    uint32_t w = twiddles[stage_offsets[stage] + j];
 
-      uint32_t w = twiddles[stage_offsets[stage] + j];
+    uint32_t t = ((uint64_t)v * w) % Q;
 
-      uint32_t t = ((uint64_t)v * w) % Q;
+    uint32_t sum = u + t;
+    if (sum >= Q)
+      sum -= Q;
 
-      uint32_t sum = u + t;
-      if (sum >= Q)
-        sum -= Q;
+    uint32_t diff = u + Q - t;
+    if (diff >= Q)
+      diff -= Q;
 
-      uint32_t diff = u + Q - t;
-      if (diff >= Q)
-        diff -= Q;
-
-      d_A[pos] = sum;
-      d_A[pos + len] = diff;
-    }
+    d_A[pos] = sum;
+    d_A[pos + len] = diff;
 
     stage++;
     __syncthreads();
@@ -108,35 +104,32 @@ __global__ void intt_kernel(uint32_t *d_A, const uint32_t n,
   for (uint32_t len = n >> 1; len >= 1; len >>= 1, loop_stage++) {
 
     uint32_t stage = total_stages - 1 - loop_stage;
-    uint32_t butterflies = n >> 1;
 
-    for (uint32_t b = tid; b < butterflies; b += blockDim.x) {
+    uint32_t b = tid;
 
-      uint32_t group =
-          b / len; // A qué bloque (grupo) lógico corresponde el thread
-      uint32_t j = b % len; // Índice del thread dentro del bloque lógico
+    uint32_t group =
+        b / len;          // A qué bloque (grupo) lógico corresponde el thread
+    uint32_t j = b % len; // Índice del thread dentro del bloque lógico
 
-      uint32_t base =
-          group * (2 * len); // Índice base del bloque (grupo) lógico
-      uint32_t pos = base + j;
+    uint32_t base = group * (2 * len); // Índice base del bloque (grupo) lógico
+    uint32_t pos = base + j;
 
-      uint32_t u = d_A[pos];
-      uint32_t v = d_A[pos + len];
+    uint32_t u = d_A[pos];
+    uint32_t v = d_A[pos + len];
 
-      uint32_t sum = u + v;
-      if (sum >= Q)
-        sum -= Q;
+    uint32_t sum = u + v;
+    if (sum >= Q)
+      sum -= Q;
 
-      uint32_t diff = u + Q - v;
-      if (diff >= Q)
-        diff -= Q;
+    uint32_t diff = u + Q - v;
+    if (diff >= Q)
+      diff -= Q;
 
-      uint32_t w = twiddles_inv[stage_offsets[stage] + j];
-      uint32_t t = ((uint64_t)diff * w) % Q;
+    uint32_t w = twiddles_inv[stage_offsets[stage] + j];
+    uint32_t t = ((uint64_t)diff * w) % Q;
 
-      d_A[pos] = sum;
-      d_A[pos + len] = t;
-    }
+    d_A[pos] = sum;
+    d_A[pos + len] = t;
 
     __syncthreads();
   }
