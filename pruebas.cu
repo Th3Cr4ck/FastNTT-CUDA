@@ -58,12 +58,9 @@ __global__ void ntt_kernel(uint32_t *d_A, const uint32_t n,
 
   for (uint32_t len = 1; len < n; len <<= 1) {
 
-    uint32_t b = tid;
-
-    // cada butterfly tiene:
     uint32_t group =
-        b / len;          // A qué bloque (grupo) lógico corresponde el thread
-    uint32_t j = b % len; // Índice del thread dentro del bloque lógico
+        tid / len;          // A qué bloque (grupo) lógico corresponde el thread
+    uint32_t j = tid % len; // Índice del thread dentro del bloque lógico
 
     uint32_t base = group * (2 * len); // Índice base del bloque (grupo) lógico
     uint32_t pos = base + j;
@@ -105,11 +102,9 @@ __global__ void intt_kernel(uint32_t *d_A, const uint32_t n,
 
     uint32_t stage = total_stages - 1 - loop_stage;
 
-    uint32_t b = tid;
-
     uint32_t group =
-        b / len;          // A qué bloque (grupo) lógico corresponde el thread
-    uint32_t j = b % len; // Índice del thread dentro del bloque lógico
+        tid / len;          // A qué bloque (grupo) lógico corresponde el thread
+    uint32_t j = tid % len; // Índice del thread dentro del bloque lógico
 
     uint32_t base = group * (2 * len); // Índice base del bloque (grupo) lógico
     uint32_t pos = base + j;
@@ -135,8 +130,8 @@ __global__ void intt_kernel(uint32_t *d_A, const uint32_t n,
   }
 
   // Normalizar resultado por N^-1
-  for (uint32_t i = tid; i < n; i += blockDim.x)
-    d_A[i] = ((uint64_t)d_A[i] * n_inv) % Q;
+  d_A[tid] = ((uint64_t)d_A[tid] * n_inv) % Q;
+  d_A[tid + blockDim.x] = ((uint64_t)d_A[tid + blockDim.x] * n_inv) % Q;
 }
 
 void FastNTT_ciclica_iterativa(uint32_t *A, uint32_t *a, uint32_t N, uint32_t w,
