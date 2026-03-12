@@ -52,72 +52,76 @@ __global__ void ntt_kernel(uint32_t *d_A, const uint32_t n,
                            const uint32_t *twiddles,
                            const uint32_t *stage_offsets) {
 
-    uint32_t tid = threadIdx.x;
+  uint32_t tid = threadIdx.x;
 
-    uint32_t stage = 0;
+  uint32_t stage = 0;
 
-    /* --------------------------
-       ETAPAS WARP (0..4)
-       -------------------------- */
+  /* --------------------------
+     ETAPAS WARP (0..4)
+     -------------------------- */
 
-    for (uint32_t len = 1; len < 32; len <<= 1) {
+  for (uint32_t len = 1; len < 32 && len < n; len <<= 1) {
 
-        uint32_t group = tid / len;
-        uint32_t j     = tid % len;
+    uint32_t group = tid / len;
+    uint32_t j = tid % len;
 
-        uint32_t base = group * (2 * len);
-        uint32_t pos  = base + j;
+    uint32_t base = group * (2 * len);
+    uint32_t pos = base + j;
 
-        uint32_t u = d_A[pos];
-        uint32_t v = d_A[pos + len];
+    uint32_t u = d_A[pos];
+    uint32_t v = d_A[pos + len];
 
-        uint32_t w = twiddles[stage_offsets[stage] + j];
-        uint32_t t = ((uint64_t)v * w) % Q;
+    uint32_t w = twiddles[stage_offsets[stage] + j];
+    uint32_t t = ((uint64_t)v * w) % Q;
 
-        uint32_t sum = u + t;
-        if (sum >= Q) sum -= Q;
+    uint32_t sum = u + t;
+    if (sum >= Q)
+      sum -= Q;
 
-        uint32_t diff = u + Q - t;
-        if (diff >= Q) diff -= Q;
+    uint32_t diff = u + Q - t;
+    if (diff >= Q)
+      diff -= Q;
 
-        d_A[pos]       = sum;
-        d_A[pos + len] = diff;
+    d_A[pos] = sum;
+    d_A[pos + len] = diff;
 
-        stage++;
-    }
+    stage++;
+  }
 
+  __syncthreads();
+
+  /* --------------------------
+     ETAPAS GENERALES
+     -------------------------- */
+
+  for (uint32_t len = 32; len < n; len <<= 1) {
+
+    uint32_t group = tid / len;
+    uint32_t j = tid % len;
+
+    uint32_t base = group * (2 * len);
+    uint32_t pos = base + j;
+
+    uint32_t u = d_A[pos];
+    uint32_t v = d_A[pos + len];
+
+    uint32_t w = twiddles[stage_offsets[stage] + j];
+    uint32_t t = ((uint64_t)v * w) % Q;
+
+    uint32_t sum = u + t;
+    if (sum >= Q)
+      sum -= Q;
+
+    uint32_t diff = u + Q - t;
+    if (diff >= Q)
+      diff -= Q;
+
+    d_A[pos] = sum;
+    d_A[pos + len] = diff;
+
+    stage++;
     __syncthreads();
-
-    /* --------------------------
-       ETAPAS GENERALES
-       -------------------------- */
-
-    for (uint32_t len = 32; len < n; len <<= 1) {
-
-        uint32_t group = tid / len;
-        uint32_t j     = tid % len;
-
-        uint32_t base = group * (2 * len);
-        uint32_t pos  = base + j;
-
-        uint32_t u = d_A[pos];
-        uint32_t v = d_A[pos + len];
-
-        uint32_t w = twiddles[stage_offsets[stage] + j];
-        uint32_t t = ((uint64_t)v * w) % Q;
-
-        uint32_t sum = u + t;
-        if (sum >= Q) sum -= Q;
-
-        uint32_t diff = u + Q - t;
-        if (diff >= Q) diff -= Q;
-
-        d_A[pos]       = sum;
-        d_A[pos + len] = diff;
-
-        stage++;
-        __syncthreads();
-    }
+  }
 }
 
 __global__ void intt_kernel(uint32_t *d_A, const uint32_t n,
@@ -128,14 +132,17 @@ __global__ void intt_kernel(uint32_t *d_A, const uint32_t n,
   const uint32_t tid = threadIdx.x;
   const uint32_t total_stages = __ffs(n) - 1; // log2(n)
 
-  uint32_t loop_stage = 0;
+  /* --------------------------
+     ETAPAS GENERALES
+     -------------------------- */
 
-  for (uint32_t len = n >> 1; len >= 1; len >>= 1, loop_stage++) {
+  uint32_t len = n >> 1;
+  uint32_t stage = total_stages - 1;
 
-    uint32_t stage = total_stages - 1 - loop_stage;
+  for (; len > 32; len >>= 1, stage--) {
 
     uint32_t group =
-        tid / len;          // A qué bloque (grupo) lógico corresponde el thread
+        tid / len; // A qué bloque (grupo) lógico corresponde el thread
     uint32_t j = tid % len; // Índice del thread dentro del bloque lógico
 
     uint32_t base = group * (2 * len); // Índice base del bloque (grupo) lógico
@@ -159,6 +166,37 @@ __global__ void intt_kernel(uint32_t *d_A, const uint32_t n,
     d_A[pos + len] = t;
 
     __syncthreads();
+  }
+
+  /* --------------------------
+     ETAPAS WARP (0..4)
+     -------------------------- */
+
+  for (; len > 0; len >>= 1, stage--) {
+
+    uint32_t group =
+        tid / len; // A qué bloque (grupo) lógico corresponde el thread
+    uint32_t j = tid % len; // Índice del thread dentro del bloque lógico
+
+    uint32_t base = group * (2 * len); // Índice base del bloque (grupo) lógico
+    uint32_t pos = base + j;
+
+    uint32_t u = d_A[pos];
+    uint32_t v = d_A[pos + len];
+
+    uint32_t sum = u + v;
+    if (sum >= Q)
+      sum -= Q;
+
+    uint32_t diff = u + Q - v;
+    if (diff >= Q)
+      diff -= Q;
+
+    uint32_t w = twiddles_inv[stage_offsets[stage] + j];
+    uint32_t t = ((uint64_t)diff * w) % Q;
+
+    d_A[pos] = sum;
+    d_A[pos + len] = t;
   }
 
   // Normalizar resultado por N^-1
