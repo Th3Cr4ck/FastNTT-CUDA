@@ -99,6 +99,78 @@ __global__ void ntt_kernel(uint32_t *d_A, const uint32_t *twiddles,
   }
 }
 
+__global__ void ntt_kernel_segmentado(uint32_t *d_A,
+                           const uint32_t *twiddles,
+                           const uint32_t *stage_offsets)
+{
+    uint32_t tid = threadIdx.x;
+    uint32_t n   = N_DEF;
+
+    uint32_t stage = 0;
+
+    /* --------------------------
+       ETAPAS WARP (0..4)
+       -------------------------- */
+
+    for (uint32_t len = 1; len < 32; len <<= 1) {
+
+        uint32_t group = tid / len;
+        uint32_t j     = tid % len;
+
+        uint32_t base = group * (2 * len);
+        uint32_t pos  = base + j;
+
+        uint32_t u = d_A[pos];
+        uint32_t v = d_A[pos + len];
+
+        uint32_t w = twiddles[stage_offsets[stage] + j];
+        uint32_t t = ((uint64_t)v * w) % Q;
+
+        uint32_t sum = u + t;
+        if (sum >= Q) sum -= Q;
+
+        uint32_t diff = u + Q - t;
+        if (diff >= Q) diff -= Q;
+
+        d_A[pos]       = sum;
+        d_A[pos + len] = diff;
+
+        stage++;
+    }
+
+    __syncthreads();
+
+    /* --------------------------
+       ETAPAS GENERALES
+       -------------------------- */
+
+    for (uint32_t len = 32; len < n; len <<= 1) {
+
+        uint32_t group = tid / len;
+        uint32_t j     = tid % len;
+
+        uint32_t base = group * (2 * len);
+        uint32_t pos  = base + j;
+
+        uint32_t u = d_A[pos];
+        uint32_t v = d_A[pos + len];
+
+        uint32_t w = twiddles[stage_offsets[stage] + j];
+        uint32_t t = ((uint64_t)v * w) % Q;
+
+        uint32_t sum = u + t;
+        if (sum >= Q) sum -= Q;
+
+        uint32_t diff = u + Q - t;
+        if (diff >= Q) diff -= Q;
+
+        d_A[pos]       = sum;
+        d_A[pos + len] = diff;
+
+        stage++;
+        __syncthreads();
+    }
+}
 __global__ void intt_kernel(uint32_t *d_A, const uint32_t *twiddles_inv,
                             const uint32_t *stage_offsets,
                             const uint32_t n_inv) {
@@ -197,7 +269,7 @@ int main() {
   /* ------------------ NTT ----------------- */
 
   // Realizar NTT
-  ntt_kernel<<<1, N_DEF / 2>>>(d_A, d_twiddles, d_stage_offsets);
+  ntt_kernel_segmentado<<<1, N_DEF / 2>>>(d_A, d_twiddles, d_stage_offsets);
 
   cudaEventRecord(stop);
   cudaEventSynchronize(stop);
