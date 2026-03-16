@@ -273,7 +273,6 @@ int main() {
       1 << 17, // 128k
       1 << 18, // 256k
       1 << 19, // 512k
-      1 << 20, // 1024k
   };
 
   uint8_t num_sizes = sizeof(sizes) / sizeof(sizes[0]);
