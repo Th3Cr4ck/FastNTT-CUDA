@@ -53,14 +53,13 @@ __global__ void ntt_stage(uint32_t *d_A, uint32_t n, const uint32_t *twiddles,
                           uint32_t len) {
 
   uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-  uint32_t pairs = n >> 1;
 
-  if (tid >= pairs)
+  if (tid >= n / 2)
     return;
 
-  uint32_t j = tid % len;
-  uint32_t group = tid / len;
-  uint32_t pos = group * (2 * len) + j;
+  uint32_t j = tid & (len - 1);
+  uint32_t group = tid >> stage;
+  uint32_t pos = (group << (stage + 1)) + j;
 
   uint32_t u = d_A[pos];
   uint32_t v = d_A[pos + len];
@@ -91,10 +90,9 @@ __global__ void ntt_warp(uint32_t *d_A, uint32_t n, const uint32_t *twiddles,
 
   for (uint32_t len = 1; len < 32 && len < n; len <<= 1) {
 
-    uint32_t group = tid / len;
-    uint32_t j = tid % len;
-
-    uint32_t pos = group * (2 * len) + j;
+    uint32_t j = tid & (len - 1);
+    uint32_t group = tid >> stage;
+    uint32_t pos = (group << (stage + 1)) + j;
 
     uint32_t u = d_A[pos];
     uint32_t v = d_A[pos + len];
@@ -127,10 +125,9 @@ __global__ void intt_stage(uint32_t *d_A, uint32_t n,
   if (tid >= pairs)
     return;
 
-  uint32_t j = tid % len;
-  uint32_t group = tid / len;
-
-  uint32_t pos = group * (2 * len) + j;
+  uint32_t j = tid & (len - 1);
+  uint32_t group = tid >> stage;
+  uint32_t pos = (group << (stage + 1)) + j;
 
   uint32_t u = d_A[pos];
   uint32_t v = d_A[pos + len];
@@ -171,10 +168,9 @@ __global__ void intt_warp(uint32_t *d_A, uint32_t n,
 
   for (uint32_t len = 32; len > 0; len >>= 1, stage--) {
 
-    uint32_t group = tid / len;
-    uint32_t j = tid % len;
-
-    uint32_t pos = group * (2 * len) + j;
+    uint32_t j = tid & (len - 1);
+    uint32_t group = tid >> stage;
+    uint32_t pos = (group << (stage + 1)) + j;
 
     uint32_t u = d_A[pos];
     uint32_t v = d_A[pos + len];
