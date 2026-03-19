@@ -73,9 +73,18 @@ void precomputar_y_copiar_twiddles(uint32_t *stage_offsets, uint32_t *twiddles,
 __global__ void ntt_block(uint32_t *d_A, const uint32_t *twiddles,
                           const uint32_t *stage_offsets) {
 
-  uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-  uint32_t total_stages = __ffs(N_DEF);
+  __shared__ uint32_t s_A[512];
 
+  uint32_t tid = threadIdx.x;
+  uint32_t base = blockIdx.x * (blockDim.x << 1);
+
+  // Cargar a shared
+  s_A[tid] = d_A[base + tid];
+  s_A[tid + blockDim.x] = d_A[base + tid + blockDim.x];
+
+  __syncthreads();
+
+  uint32_t total_stages = __ffs(N_DEF);
   uint32_t stage = 0;
 
   // Warp stages
@@ -87,23 +96,23 @@ __global__ void ntt_block(uint32_t *d_A, const uint32_t *twiddles,
     uint32_t group = tid >> stage;
     uint32_t pos = (group << (stage + 1)) + j;
 
-    uint32_t u = d_A[pos];
-    uint32_t v = d_A[pos + len];
+    uint32_t u = s_A[pos];
+    uint32_t v = s_A[pos + len];
 
     uint32_t w = twiddles[stage_offsets[stage] + j];
     uint32_t t = ((uint64_t)v * w) % Q;
 
     uint32_t sum = u + t;
-    if (sum >= Q)
-      sum -= Q;
+    if (sum >= Q) sum -= Q;
 
     uint32_t diff = u + Q - t;
-    if (diff >= Q)
-      diff -= Q;
+    if (diff >= Q) diff -= Q;
 
-    d_A[pos] = sum;
-    d_A[pos + len] = diff;
+    s_A[pos] = sum;
+    s_A[pos + len] = diff;
   }
+
+  __syncthreads();
 
   // Intra block
   for (; stage < 8 && stage < total_stages; stage++) {
@@ -114,25 +123,27 @@ __global__ void ntt_block(uint32_t *d_A, const uint32_t *twiddles,
     uint32_t group = tid >> stage;
     uint32_t pos = (group << (stage + 1)) + j;
 
-    uint32_t u = d_A[pos];
-    uint32_t v = d_A[pos + len];
+    uint32_t u = s_A[pos];
+    uint32_t v = s_A[pos + len];
 
     uint32_t w = twiddles[stage_offsets[stage] + j];
     uint32_t t = ((uint64_t)v * w) % Q;
 
     uint32_t sum = u + t;
-    if (sum >= Q)
-      sum -= Q;
+    if (sum >= Q) sum -= Q;
 
     uint32_t diff = u + Q - t;
-    if (diff >= Q)
-      diff -= Q;
+    if (diff >= Q) diff -= Q;
 
-    d_A[pos] = sum;
-    d_A[pos + len] = diff;
+    s_A[pos] = sum;
+    s_A[pos + len] = diff;
 
     __syncthreads();
   }
+
+  // Escribir de regreso
+  d_A[base + tid] = s_A[tid];
+  d_A[base + tid + blockDim.x] = s_A[tid + blockDim.x];
 }
 
 __global__ void ntt_stage(uint32_t *d_A, const uint32_t *twiddles,
@@ -199,10 +210,18 @@ __global__ void intt_stage(uint32_t *d_A, const uint32_t *twiddles_inv,
 __global__ void intt_block(uint32_t *d_A, const uint32_t *twiddles_inv,
                            const uint32_t *stage_offsets) {
 
+  __shared__ uint32_t s_A[512];
+
   uint32_t tid = threadIdx.x;
   uint32_t base = blockIdx.x * (blockDim.x << 1);
 
-  // Intra block stage
+  // Cargar a shared
+  s_A[tid] = d_A[base + tid];
+  s_A[tid + blockDim.x] = d_A[base + tid + blockDim.x];
+
+  __syncthreads();
+
+  // Intra block (stages grandes)
   for (uint32_t loop_stage = 0; loop_stage < 3; loop_stage++) {
 
     uint32_t stage = 7 - loop_stage;
@@ -210,10 +229,10 @@ __global__ void intt_block(uint32_t *d_A, const uint32_t *twiddles_inv,
 
     uint32_t j = tid & (len - 1);
     uint32_t group = tid >> stage;
-    uint32_t pos = base + (group << (stage + 1)) + j;
+    uint32_t pos = (group << (stage + 1)) + j;
 
-    uint32_t u = d_A[pos];
-    uint32_t v = d_A[pos + len];
+    uint32_t u = s_A[pos];
+    uint32_t v = s_A[pos + len];
 
     uint32_t sum = u + v;
     if (sum >= Q) sum -= Q;
@@ -224,24 +243,24 @@ __global__ void intt_block(uint32_t *d_A, const uint32_t *twiddles_inv,
     uint32_t w = twiddles_inv[stage_offsets[stage] + j];
     uint32_t t = ((uint64_t)diff * w) % Q;
 
-    d_A[pos] = sum;
-    d_A[pos + len] = t;
+    s_A[pos] = sum;
+    s_A[pos + len] = t;
 
     __syncthreads();
   }
 
-  // Warp stages
+  // Warp stages (stages pequeños)
   for (uint32_t loop_stage = 3; loop_stage < 8; loop_stage++) {
 
     uint32_t stage = 7 - loop_stage;
-    uint32_t len = 1u << stage;
+    uint32_t len = 1 << stage;
 
     uint32_t j = tid & (len - 1);
     uint32_t group = tid >> stage;
-    uint32_t pos = base + (group << (stage + 1)) + j;
+    uint32_t pos = (group << (stage + 1)) + j;
 
-    uint32_t u = d_A[pos];
-    uint32_t v = d_A[pos + len];
+    uint32_t u = s_A[pos];
+    uint32_t v = s_A[pos + len];
 
     uint32_t sum = u + v;
     if (sum >= Q) sum -= Q;
@@ -252,9 +271,15 @@ __global__ void intt_block(uint32_t *d_A, const uint32_t *twiddles_inv,
     uint32_t w = twiddles_inv[stage_offsets[stage] + j];
     uint32_t t = ((uint64_t)diff * w) % Q;
 
-    d_A[pos] = sum;
-    d_A[pos + len] = t;
+    s_A[pos] = sum;
+    s_A[pos + len] = t;
   }
+
+  __syncthreads();
+
+  // Escribir de regreso
+  d_A[base + tid] = s_A[tid];
+  d_A[base + tid + blockDim.x] = s_A[tid + blockDim.x];
 }
 
 __global__ void intt_normalize(uint32_t *d_A, uint32_t n_inv) {
@@ -312,6 +337,8 @@ int main() {
   uint32_t threads = 256;
   uint32_t pairs = N_DEF / 2;
   uint32_t stage_blocks = (pairs + threads - 1) / threads;
+  uint32_t elems_per_block = threads * 2;
+  uint32_t blocks = (N_DEF + elems_per_block - 1) / elems_per_block;
 
   // Medicion temporal
   cudaEvent_t start, stop;
@@ -321,7 +348,7 @@ int main() {
 
   /* ------------------ NTT ----------------- */
 
-  ntt_block<<<stage_blocks, threads>>>(d_A, d_twiddles, d_stage_offsets);
+  ntt_block<<<blocks, threads>>>(d_A, d_twiddles, d_stage_offsets);
 
   uint32_t stage = 8;
   for (uint32_t len = 256; len < N_DEF; len <<= 1) {
