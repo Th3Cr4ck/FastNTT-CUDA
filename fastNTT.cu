@@ -75,8 +75,8 @@ __global__ void ntt_block(uint32_t *d_A, const uint32_t *twiddles,
 
   __shared__ uint32_t s_A[512];
 
-  uint32_t tid = threadIdx.x;
-  uint32_t base = blockIdx.x * (blockDim.x << 1);
+  uint32_t tid = threadIdx.x; // 0 a 255
+  uint32_t base = blockIdx.x * (blockDim.x << 1); // Indice de inicio del bloque logico de 512 elementos
 
   // Cargar a shared
   s_A[tid] = d_A[base + tid];
@@ -336,9 +336,9 @@ int main() {
 
   uint32_t threads = 256;
   uint32_t pairs = N_DEF / 2;
-  uint32_t stage_blocks = (pairs + threads - 1) / threads;
+  uint32_t stage_blocks = (pairs + threads - 1) / threads; // blocks = ceil(butterflies/threads)
   uint32_t elems_per_block = threads * 2;
-  uint32_t blocks = (N_DEF + elems_per_block - 1) / elems_per_block;
+  uint32_t blocks = (N_DEF + elems_per_block - 1) / elems_per_block; // blocks = ceil(N/512)
 
   // Medicion temporal
   cudaEvent_t start, stop;
