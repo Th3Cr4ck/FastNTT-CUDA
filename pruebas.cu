@@ -7,6 +7,28 @@
 
 #define Q 998244353
 #define G 3
+#define R_BITS 32
+#define R (1ULL << R_BITS)
+
+uint32_t compute_n_inv(uint32_t n) {
+  // n* x ≡ 1 (mod 2^32), resuelto iterativamente
+  uint32_t x = 1;
+  for (int i = 0; i < 31; i++)
+    x *= 2 - n * x;
+  return -x; // Retorna -Q^(-1) mod 2^32
+}
+
+__host__ __device__ __forceinline__ uint32_t mont_reduce(uint64_t x,
+                                                         uint32_t n_inv) {
+  uint32_t m = (uint32_t)x * n_inv;         // m = x * (-Q^{-1}) mod 2^32
+  uint32_t t = (x + (uint64_t)m * Q) >> 32; // t = (x + m*Q) / 2^32
+  return t >= Q ? t - Q : t;
+}
+
+__host__ __device__ __forceinline__ uint32_t mont_mul(uint32_t a, uint32_t b,
+                                                      uint32_t n_inv) {
+  return mont_reduce((uint64_t)a * b, n_inv);
+}
 
 uint32_t power(uint32_t base, uint32_t exp, uint32_t mod) {
   uint64_t res = 1;
@@ -20,27 +42,34 @@ uint32_t power(uint32_t base, uint32_t exp, uint32_t mod) {
   return (uint32_t)res;
 }
 
-void precomputar_y_copiar_twiddles(uint32_t n, uint32_t *stage_offsets,
-                                   uint32_t *twiddles, uint32_t *twiddles_inv) {
+void imprimir_arreglo(uint32_t *A, uint32_t N) {
+  for (uint32_t i = 0; i < N; i++) {
+    printf("%d ", A[i]);
+  }
+  printf("\n");
+}
+
+void precomputar_y_copiar_twiddles(uint32_t *stage_offsets, uint32_t N,
+                                   uint32_t *twiddles, uint32_t *twiddles_inv,
+                                   uint32_t R2, uint32_t n_inv) {
 
   uint32_t offset = 0;
   uint32_t stage = 0;
 
-  uint32_t w = power(G, (Q - 1) / n, Q);
+  uint32_t w = power(G, (Q - 1) / N, Q);
   uint32_t w_inv = power(w, Q - 2, Q);
 
-  for (int len = 2; len <= n; len <<= 1) {
+  for (int len = 2; len <= N; len <<= 1) {
 
     stage_offsets[stage] = offset;
     uint32_t mid = len >> 1;
 
     for (int k = 0; k < mid; k++) {
 
-      uint32_t exponent = (n / len) * k;
+      uint32_t exponent = (N / len) * k;
 
-      twiddles[offset + k] = power(w, exponent, Q);
-
-      twiddles_inv[offset + k] = power(w_inv, exponent, Q);
+      twiddles[offset + k] = mont_mul(power(w, exponent, Q), R2, n_inv);
+      twiddles_inv[offset + k] = mont_mul(power(w_inv, exponent, Q), R2, n_inv);
     }
 
     offset += mid;
@@ -48,13 +77,24 @@ void precomputar_y_copiar_twiddles(uint32_t n, uint32_t *stage_offsets,
   }
 }
 
-__global__ void ntt_block(uint32_t *d_A, uint32_t n, const uint32_t *twiddles,
-                          const uint32_t *stage_offsets) {
+__global__ void to_montgomery(uint32_t *d_A, uint32_t N, uint32_t R2,
+                              uint32_t n_inv) {
+  uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= N)
+    return;
+  // a_mont = a * R mod Q = mont_mul(a, R^2)
+  d_A[tid] = mont_mul(d_A[tid], R2, n_inv);
+}
+
+__global__ void ntt_block(uint32_t *d_A, uint32_t N, const uint32_t *twiddles,
+                          const uint32_t *stage_offsets, uint32_t n_inv) {
 
   __shared__ uint32_t s_A[512];
 
-  uint32_t tid = threadIdx.x;
-  uint32_t base = blockIdx.x * (blockDim.x << 1);
+  uint32_t tid = threadIdx.x; // 0 a 255
+  uint32_t base =
+      blockIdx.x *
+      (blockDim.x << 1); // Indice de inicio del bloque logico de 512 elementos
 
   // Cargar a shared
   s_A[tid] = d_A[base + tid];
@@ -62,7 +102,7 @@ __global__ void ntt_block(uint32_t *d_A, uint32_t n, const uint32_t *twiddles,
 
   __syncthreads();
 
-  uint32_t total_stages = __ffs(n);
+  uint32_t total_stages = __ffs(N);
   uint32_t stage = 0;
 
   // Warp stages
@@ -78,7 +118,7 @@ __global__ void ntt_block(uint32_t *d_A, uint32_t n, const uint32_t *twiddles,
     uint32_t v = s_A[pos + len];
 
     uint32_t w = twiddles[stage_offsets[stage] + j];
-    uint32_t t = ((uint64_t)v * w) % Q;
+    uint32_t t = mont_mul(v, w, n_inv);
 
     uint32_t sum = u + t;
     if (sum >= Q)
@@ -107,7 +147,7 @@ __global__ void ntt_block(uint32_t *d_A, uint32_t n, const uint32_t *twiddles,
     uint32_t v = s_A[pos + len];
 
     uint32_t w = twiddles[stage_offsets[stage] + j];
-    uint32_t t = ((uint64_t)v * w) % Q;
+    uint32_t t = mont_mul(v, w, n_inv);
 
     uint32_t sum = u + t;
     if (sum >= Q)
@@ -128,13 +168,13 @@ __global__ void ntt_block(uint32_t *d_A, uint32_t n, const uint32_t *twiddles,
   d_A[base + tid + blockDim.x] = s_A[tid + blockDim.x];
 }
 
-__global__ void ntt_stage(uint32_t *d_A, uint32_t n, const uint32_t *twiddles,
+__global__ void ntt_stage(uint32_t *d_A, uint32_t N, const uint32_t *twiddles,
                           const uint32_t *stage_offsets, uint32_t stage,
-                          uint32_t len) {
+                          uint32_t len, uint32_t n_inv) {
 
   uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
 
-  if (tid >= n / 2)
+  if (tid >= N / 2)
     return;
 
   uint32_t j = tid & (len - 1);
@@ -145,7 +185,7 @@ __global__ void ntt_stage(uint32_t *d_A, uint32_t n, const uint32_t *twiddles,
   uint32_t v = d_A[pos + len];
 
   uint32_t w = twiddles[stage_offsets[stage] + j];
-  uint32_t t = ((uint64_t)v * w) % Q;
+  uint32_t t = mont_mul(v, w, n_inv);
 
   uint32_t sum = u + t;
   if (sum >= Q)
@@ -157,126 +197,6 @@ __global__ void ntt_stage(uint32_t *d_A, uint32_t n, const uint32_t *twiddles,
 
   d_A[pos] = sum;
   d_A[pos + len] = diff;
-}
-
-__global__ void intt_stage(uint32_t *d_A, uint32_t n,
-                           const uint32_t *twiddles_inv,
-                           const uint32_t *stage_offsets, uint32_t stage,
-                           uint32_t len) {
-  uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-
-  if (tid >= n >> 1)
-    return;
-
-  uint32_t j = tid & (len - 1);
-  uint32_t group = tid >> stage;
-  uint32_t pos = (group << (stage + 1)) + j;
-
-  uint32_t u = d_A[pos];
-  uint32_t v = d_A[pos + len];
-
-  uint32_t sum = u + v;
-  if (sum >= Q)
-    sum -= Q;
-
-  uint32_t diff = u + Q - v;
-  if (diff >= Q)
-    diff -= Q;
-
-  uint32_t w = twiddles_inv[stage_offsets[stage] + j];
-  uint32_t t = ((uint64_t)diff * w) % Q;
-
-  d_A[pos] = sum;
-  d_A[pos + len] = t;
-}
-
-__global__ void intt_block(uint32_t *d_A, uint32_t n,
-                           const uint32_t *twiddles_inv,
-                           const uint32_t *stage_offsets) {
-
-  __shared__ uint32_t s_A[512];
-
-  uint32_t tid = threadIdx.x;
-  uint32_t base = blockIdx.x * (blockDim.x << 1);
-
-  // Cargar a shared
-  s_A[tid] = d_A[base + tid];
-  s_A[tid + blockDim.x] = d_A[base + tid + blockDim.x];
-
-  __syncthreads();
-
-  // Intra block (stages grandes)
-  for (uint32_t loop_stage = 0; loop_stage < 3; loop_stage++) {
-
-    uint32_t stage = 7 - loop_stage;
-    uint32_t len = 1 << stage;
-
-    uint32_t j = tid & (len - 1);
-    uint32_t group = tid >> stage;
-    uint32_t pos = (group << (stage + 1)) + j;
-
-    uint32_t u = s_A[pos];
-    uint32_t v = s_A[pos + len];
-
-    uint32_t sum = u + v;
-    if (sum >= Q)
-      sum -= Q;
-
-    uint32_t diff = u + Q - v;
-    if (diff >= Q)
-      diff -= Q;
-
-    uint32_t w = twiddles_inv[stage_offsets[stage] + j];
-    uint32_t t = ((uint64_t)diff * w) % Q;
-
-    s_A[pos] = sum;
-    s_A[pos + len] = t;
-
-    __syncthreads();
-  }
-
-  // Warp stages (stages pequeños)
-  for (uint32_t loop_stage = 3; loop_stage < 8; loop_stage++) {
-
-    uint32_t stage = 7 - loop_stage;
-    uint32_t len = 1 << stage;
-
-    uint32_t j = tid & (len - 1);
-    uint32_t group = tid >> stage;
-    uint32_t pos = (group << (stage + 1)) + j;
-
-    uint32_t u = s_A[pos];
-    uint32_t v = s_A[pos + len];
-
-    uint32_t sum = u + v;
-    if (sum >= Q)
-      sum -= Q;
-
-    uint32_t diff = u + Q - v;
-    if (diff >= Q)
-      diff -= Q;
-
-    uint32_t w = twiddles_inv[stage_offsets[stage] + j];
-    uint32_t t = ((uint64_t)diff * w) % Q;
-
-    s_A[pos] = sum;
-    s_A[pos + len] = t;
-  }
-
-  __syncthreads();
-
-  // Escribir de regreso
-  d_A[base + tid] = s_A[tid];
-  d_A[base + tid + blockDim.x] = s_A[tid + blockDim.x];
-}
-
-__global__ void intt_normalize(uint32_t *d_A, uint32_t n, uint32_t n_inv) {
-  uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-
-  if (tid >= n)
-    return;
-
-  d_A[tid] = ((uint64_t)d_A[tid] * n_inv) % Q;
 }
 
 void FastNTT_ciclica_iterativa(uint32_t *A, uint32_t *a, uint32_t N, uint32_t w,
@@ -358,7 +278,7 @@ int main() {
       1 << 18, // 256k
       1 << 19, // 512k
       1 << 20, // 1M
-      1 << 21 // 1M
+      1 << 21  // 1M
   };
 
   uint8_t num_sizes = sizeof(sizes) / sizeof(sizes[0]);
@@ -376,9 +296,12 @@ int main() {
     fill_random(A, N);
 
     // Precomputar twiddles
+    uint32_t n_inv = compute_n_inv(Q);
+    uint32_t R2 = (uint64_t)(R % Q) * (R % Q) % Q; // R^2 mod Q
     const uint32_t MAX_TWIDDLES = N - 1;
-    uint32_t *twiddles = (uint32_t*)malloc(sizeof(uint32_t)*MAX_TWIDDLES);
-    uint32_t *twiddles_inv = (uint32_t*)malloc(sizeof(uint32_t)*MAX_TWIDDLES);
+    uint32_t *twiddles = (uint32_t *)malloc(sizeof(uint32_t) * MAX_TWIDDLES);
+    uint32_t *twiddles_inv =
+        (uint32_t *)malloc(sizeof(uint32_t) * MAX_TWIDDLES);
     uint32_t stages = 0;
     uint32_t tmp = N;
     while (tmp > 1) {
@@ -386,7 +309,8 @@ int main() {
       tmp >>= 1;
     }
     uint32_t *stage_offsets = (uint32_t *)malloc(sizeof(uint32_t) * stages);
-    precomputar_y_copiar_twiddles(N, stage_offsets, twiddles, twiddles_inv);
+    precomputar_y_copiar_twiddles(stage_offsets, N, twiddles, twiddles_inv, R2,
+                                  n_inv);
 
     // Pasar los datos a memoria global del GPU
     uint32_t *d_A;
@@ -412,13 +336,18 @@ int main() {
     uint32_t elems_per_block = threads * 2;
     uint32_t blocks = (N + elems_per_block - 1) / elems_per_block;
 
-    ntt_block<<<blocks, threads>>>(d_A, N, d_twiddles, d_stage_offsets);
+    uint32_t norm_threads = 256;
+    uint32_t norm_blocks = (N + norm_threads - 1) / norm_threads;
+
+    to_montgomery<<<norm_blocks, norm_threads>>>(d_A, N, R2, n_inv);
+
+    ntt_block<<<blocks, threads>>>(d_A, N, d_twiddles, d_stage_offsets, n_inv);
 
     uint32_t stage = 8;
     for (uint32_t len = 256; len < N; len <<= 1) {
 
       ntt_stage<<<stage_blocks, threads>>>(d_A, N, d_twiddles, d_stage_offsets,
-                                           stage, len);
+                                           stage, len, n_inv);
       stage++;
     }
 
@@ -434,13 +363,13 @@ int main() {
       // restaurar entrada para cada corrida
       cudaMemcpy(d_A, A, sizeof(uint32_t) * N, cudaMemcpyHostToDevice);
 
-      ntt_block<<<blocks, threads>>>(d_A, N, d_twiddles, d_stage_offsets);
+      ntt_block<<<blocks, threads>>>(d_A, N, d_twiddles, d_stage_offsets, n_inv);
 
       uint32_t stage = 8;
       for (uint32_t len = 256; len < N; len <<= 1) {
 
         ntt_stage<<<stage_blocks, threads>>>(d_A, N, d_twiddles,
-                                             d_stage_offsets, stage, len);
+                                             d_stage_offsets, stage, len, n_inv);
         stage++;
       }
     }
