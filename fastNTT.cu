@@ -1,42 +1,52 @@
-#include <cstdint>
-#include <cstdlib>
-#include <cuda_device_runtime_api.h>
-#include <cuda_runtime_api.h>
-#include <driver_types.h>
+// ntt2d.cu
+// NTT 2D para multiplicación de polinomios bivariables A(x,y) * B(x,y)
+// Estrategia: NTT separable por filas y columnas (Cooley-Tukey 2D)
+//
+// Layout de memoria: row-major, A[row][col] = A[row * NX + col]
+// Flujo:
+//   NTT_filas(A), NTT_filas(B)
+//   Transponer(A), Transponer(B)
+//   NTT_filas(A^T), NTT_filas(B^T)   <- esto equivale a NTT_columnas
+//   Multiplicación puntual: C = A * B
+//   INTT_filas(C)
+//   Transponer(C)
+//   INTT_filas(C^T)                   <- INTT_columnas
+//   Normalizar(C)
+
+#include <cuda_runtime.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <texture_indirect_functions.h>
+#include <stdlib.h>
 
-// #define LEN_TINY
-#define LEN_LARGE
+// ============================================================
+//  Configuración: dimensiones y primo
+// ============================================================
 
-#ifdef LEN_TINY
-#define N_DEF 64
-#define Q 3329
-#elif defined(LEN_LARGE)
-#define N_DEF 2048
-#define Q 998244353
-#else
-#error "Debes definir LEN_8 o LEN_LARGE"
-#endif
+// NX y NY deben ser potencias de 2
+// El primo Q debe satisfacer Q-1 divisible por max(NX, NY)
+#define NX 2048
+#define NY 2048
+#define Q 998244353U // primo NTT-friendly: 998244353 = 119 * 2^23 + 1
+#define G 3U         // raíz primitiva de Q
 
-#define G 3
-#define MAX_TWIDDLES (N_DEF - 1)
+// ============================================================
+//  Aritmética de Montgomery
+// ============================================================
+
 #define R_BITS 32
 #define R (1ULL << R_BITS)
 
-uint32_t compute_n_inv(uint32_t n) {
-  // n* x ≡ 1 (mod 2^32), resuelto iterativamente
+static uint32_t compute_n_inv(uint32_t n) {
   uint32_t x = 1;
   for (int i = 0; i < 31; i++)
     x *= 2 - n * x;
-  return -x; // Retorna -Q^(-1) mod 2^32
+  return -x;
 }
 
 __host__ __device__ __forceinline__ uint32_t mont_reduce(uint64_t x,
                                                          uint32_t n_inv) {
-  uint32_t m = (uint32_t)x * n_inv;         // m = x * (-Q^{-1}) mod 2^32
-  uint32_t t = (x + (uint64_t)m * Q) >> 32; // t = (x + m*Q) / 2^32
+  uint32_t m = (uint32_t)x * n_inv;
+  uint32_t t = (x + (uint64_t)m * Q) >> 32;
   return t >= Q ? t - Q : t;
 }
 
@@ -45,409 +55,589 @@ __host__ __device__ __forceinline__ uint32_t mont_mul(uint32_t a, uint32_t b,
   return mont_reduce((uint64_t)a * b, n_inv);
 }
 
-uint32_t power(uint32_t base, uint32_t exp, uint32_t mod) {
+// ============================================================
+//  Utilidades en host
+// ============================================================
+
+static uint32_t power(uint32_t base, uint32_t exp, uint32_t mod) {
   uint64_t res = 1;
   base %= mod;
   while (exp > 0) {
-    if (exp % 2 == 1)
-      res = (res * base) % mod;
-    base = ((uint64_t)base * base) % mod;
-    exp /= 2;
+    if (exp & 1)
+      res = res * base % mod;
+    base = (uint64_t)base * base % mod;
+    exp >>= 1;
   }
   return (uint32_t)res;
 }
 
-void imprimir_arreglo(uint32_t *A, uint32_t N) {
-  for (uint32_t i = 0; i < N; i++) {
-    printf("%d ", A[i]);
+static void print_array(const char *label, uint32_t *A, uint32_t rows,
+                        uint32_t cols) {
+  printf("%s (%ux%u):\n", label, rows, cols);
+  uint32_t show_r = rows < 4 ? rows : 4;
+  uint32_t show_c = cols < 8 ? cols : 8;
+  for (uint32_t r = 0; r < show_r; r++) {
+    for (uint32_t c = 0; c < show_c; c++)
+      printf("%10u ", A[r * cols + c]);
+    printf("...\n");
   }
-  printf("\n");
+  printf("...\n\n");
 }
 
-void precomputar_y_copiar_twiddles(uint32_t *stage_offsets, uint32_t *twiddles,
-                                   uint32_t *twiddles_inv, uint32_t R2, uint32_t n_inv) {
+// ============================================================
+//  Precomputo de twiddles para una longitud N dada
+//  Misma lógica que antes, parametrizada
+// ============================================================
 
-  uint32_t offset = 0;
-  uint32_t stage = 0;
-
-  uint32_t w = power(G, (Q - 1) / N_DEF, Q);
+static void precompute_twiddles(uint32_t N, uint32_t *stage_offsets,
+                                uint32_t *twiddles, uint32_t *twiddles_inv,
+                                uint32_t R2, uint32_t n_inv) {
+  uint32_t w = power(G, (Q - 1) / N, Q);
   uint32_t w_inv = power(w, Q - 2, Q);
 
-  for (int len = 2; len <= N_DEF; len <<= 1) {
-
+  uint32_t offset = 0, stage = 0;
+  for (uint32_t len = 2; len <= N; len <<= 1) {
     stage_offsets[stage] = offset;
     uint32_t mid = len >> 1;
-
-    for (int k = 0; k < mid; k++) {
-
-      uint32_t exponent = (N_DEF / len) * k;
-
-      twiddles[offset + k] = mont_mul(power(w, exponent, Q), R2, n_inv);
-      twiddles_inv[offset + k] = mont_mul(power(w_inv, exponent, Q), R2, n_inv);
+    for (uint32_t k = 0; k < mid; k++) {
+      uint32_t exp = (N / len) * k;
+      twiddles[offset + k] = mont_mul(power(w, exp, Q), R2, n_inv);
+      twiddles_inv[offset + k] = mont_mul(power(w_inv, exp, Q), R2, n_inv);
     }
-
     offset += mid;
     stage++;
   }
 }
 
-__global__ void to_montgomery(uint32_t *d_A, uint32_t R2, uint32_t n_inv) {
+// ============================================================
+//  KERNELS
+// ============================================================
+
+// Convierte N elementos a representación Montgomery
+__global__ void to_montgomery(uint32_t *d_A, uint32_t R2, uint32_t n_inv,
+                              uint32_t N) {
   uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid >= N_DEF)
+  if (tid >= N)
     return;
-  // a_mont = a * R mod Q = mont_mul(a, R^2)
   d_A[tid] = mont_mul(d_A[tid], R2, n_inv);
 }
 
+// ---- NTT block (primeros 9 stages, shared memory 512 elementos) ----
 __global__ void ntt_block(uint32_t *d_A, const uint32_t *twiddles,
-                          const uint32_t *stage_offsets, uint32_t n_inv) {
-
+                          const uint32_t *stage_offsets, uint32_t n_inv,
+                          uint32_t total_stages) {
   __shared__ uint32_t s_A[512];
 
-  uint32_t tid = threadIdx.x; // 0 a 255
-  uint32_t base =
-      blockIdx.x *
-      (blockDim.x << 1); // Indice de inicio del bloque logico de 512 elementos
+  uint32_t tid = threadIdx.x;
+  uint32_t base = blockIdx.x * (blockDim.x << 1);
 
-  // Cargar a shared
   s_A[tid] = d_A[base + tid];
   s_A[tid + blockDim.x] = d_A[base + tid + blockDim.x];
-
   __syncthreads();
 
-  uint32_t total_stages = __ffs(N_DEF);
   uint32_t stage = 0;
 
-  // Warp stages
+  // Warp stages (no necesitan __syncthreads)
   for (; stage < 5 && stage < total_stages; stage++) {
-
-    uint32_t len = 1 << stage;
-
+    uint32_t len = 1u << stage;
     uint32_t j = tid & (len - 1);
     uint32_t group = tid >> stage;
     uint32_t pos = (group << (stage + 1)) + j;
 
-    uint32_t u = s_A[pos];
-    uint32_t v = s_A[pos + len];
-
+    uint32_t u = s_A[pos], v = s_A[pos + len];
     uint32_t w = twiddles[stage_offsets[stage] + j];
     uint32_t t = mont_mul(v, w, n_inv);
 
     uint32_t sum = u + t;
     if (sum >= Q)
       sum -= Q;
-
     uint32_t diff = u + Q - t;
     if (diff >= Q)
       diff -= Q;
-
     s_A[pos] = sum;
     s_A[pos + len] = diff;
   }
-
   __syncthreads();
 
-  // Intra block
-  for (; stage < 8 && stage < total_stages; stage++) {
-
-    uint32_t len = 1 << stage;
-
+  // Intra-block stages
+  for (; stage < 9 && stage < total_stages; stage++) {
+    uint32_t len = 1u << stage;
     uint32_t j = tid & (len - 1);
     uint32_t group = tid >> stage;
     uint32_t pos = (group << (stage + 1)) + j;
 
-    uint32_t u = s_A[pos];
-    uint32_t v = s_A[pos + len];
-
+    uint32_t u = s_A[pos], v = s_A[pos + len];
     uint32_t w = twiddles[stage_offsets[stage] + j];
     uint32_t t = mont_mul(v, w, n_inv);
 
     uint32_t sum = u + t;
     if (sum >= Q)
       sum -= Q;
-
     uint32_t diff = u + Q - t;
     if (diff >= Q)
       diff -= Q;
-
     s_A[pos] = sum;
     s_A[pos + len] = diff;
-
     __syncthreads();
   }
 
-  // Escribir de regreso
   d_A[base + tid] = s_A[tid];
   d_A[base + tid + blockDim.x] = s_A[tid + blockDim.x];
 }
 
+// ---- NTT stage individual (stages >= 9) ----
 __global__ void ntt_stage(uint32_t *d_A, const uint32_t *twiddles,
                           const uint32_t *stage_offsets, uint32_t stage,
-                          uint32_t len, uint32_t n_inv) {
-
+                          uint32_t len, uint32_t n_inv, uint32_t N) {
   uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-
-  if (tid >= N_DEF / 2)
+  if (tid >= N / 2)
     return;
 
   uint32_t j = tid & (len - 1);
   uint32_t group = tid >> stage;
   uint32_t pos = (group << (stage + 1)) + j;
 
-  uint32_t u = d_A[pos];
-  uint32_t v = d_A[pos + len];
-
+  uint32_t u = d_A[pos], v = d_A[pos + len];
   uint32_t w = twiddles[stage_offsets[stage] + j];
   uint32_t t = mont_mul(v, w, n_inv);
 
   uint32_t sum = u + t;
   if (sum >= Q)
     sum -= Q;
-
   uint32_t diff = u + Q - t;
   if (diff >= Q)
     diff -= Q;
-
   d_A[pos] = sum;
   d_A[pos + len] = diff;
 }
 
+// ---- INTT block ----
+__global__ void intt_block(uint32_t *d_A, const uint32_t *twiddles_inv,
+                           const uint32_t *stage_offsets, uint32_t n_inv,
+                           uint32_t total_stages) {
+  __shared__ uint32_t s_A[512];
+
+  uint32_t tid = threadIdx.x;
+  uint32_t base = blockIdx.x * (blockDim.x << 1);
+
+  s_A[tid] = d_A[base + tid];
+  s_A[tid + blockDim.x] = d_A[base + tid + blockDim.x];
+  __syncthreads();
+
+  // Intra-block (stages grandes primero en INTT)
+  uint32_t intra = total_stages < 9 ? total_stages : 9;
+  for (uint32_t ls = 0; ls < 3 && ls < intra; ls++) {
+    uint32_t stage = (intra - 1) - ls;
+    uint32_t len = 1u << stage;
+    uint32_t j = tid & (len - 1);
+    uint32_t group = tid >> stage;
+    uint32_t pos = (group << (stage + 1)) + j;
+
+    uint32_t u = s_A[pos], v = s_A[pos + len];
+    uint32_t sum = u + v;
+    if (sum >= Q)
+      sum -= Q;
+    uint32_t diff = u + Q - v;
+    if (diff >= Q)
+      diff -= Q;
+    uint32_t w = twiddles_inv[stage_offsets[stage] + j];
+    uint32_t t = mont_mul(diff, w, n_inv);
+    s_A[pos] = sum;
+    s_A[pos + len] = t;
+    __syncthreads();
+  }
+
+  // Warp stages (pequeños)
+  for (uint32_t ls = 3; ls < intra; ls++) {
+    uint32_t stage = (intra - 1) - ls;
+    uint32_t len = 1u << stage;
+    uint32_t j = tid & (len - 1);
+    uint32_t group = tid >> stage;
+    uint32_t pos = (group << (stage + 1)) + j;
+
+    uint32_t u = s_A[pos], v = s_A[pos + len];
+    uint32_t sum = u + v;
+    if (sum >= Q)
+      sum -= Q;
+    uint32_t diff = u + Q - v;
+    if (diff >= Q)
+      diff -= Q;
+    uint32_t w = twiddles_inv[stage_offsets[stage] + j];
+    uint32_t t = mont_mul(diff, w, n_inv);
+    s_A[pos] = sum;
+    s_A[pos + len] = t;
+  }
+  __syncthreads();
+
+  d_A[base + tid] = s_A[tid];
+  d_A[base + tid + blockDim.x] = s_A[tid + blockDim.x];
+}
+
+// ---- INTT stage individual ----
 __global__ void intt_stage(uint32_t *d_A, const uint32_t *twiddles_inv,
                            const uint32_t *stage_offsets, uint32_t stage,
-                           uint32_t len, uint32_t n_inv) {
+                           uint32_t len, uint32_t n_inv, uint32_t N) {
   uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-
-  if (tid >= N_DEF >> 1)
+  if (tid >= N / 2)
     return;
 
   uint32_t j = tid & (len - 1);
   uint32_t group = tid >> stage;
   uint32_t pos = (group << (stage + 1)) + j;
 
-  uint32_t u = d_A[pos];
-  uint32_t v = d_A[pos + len];
-
+  uint32_t u = d_A[pos], v = d_A[pos + len];
   uint32_t sum = u + v;
   if (sum >= Q)
     sum -= Q;
-
   uint32_t diff = u + Q - v;
   if (diff >= Q)
     diff -= Q;
-
   uint32_t w = twiddles_inv[stage_offsets[stage] + j];
   uint32_t t = mont_mul(diff, w, n_inv);
-
   d_A[pos] = sum;
   d_A[pos + len] = t;
 }
 
-__global__ void intt_block(uint32_t *d_A, const uint32_t *twiddles_inv,
-                           const uint32_t *stage_offsets, uint32_t n_inv) {
+// ---- Normalización final INTT ----
+__global__ void intt_normalize(uint32_t *d_A, uint32_t n_inv,
+                               uint32_t N_inv_mont, uint32_t N) {
+  uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= N)
+    return;
+  uint32_t val = mont_reduce((uint64_t)d_A[tid], n_inv);
+  d_A[tid] = mont_mul(val, N_inv_mont, n_inv);
+}
 
-  __shared__ uint32_t s_A[512];
+// ---- Multiplicación puntual en dominio frecuencial ----
+__global__ void pointwise_mul(uint32_t *d_C, const uint32_t *d_A,
+                              const uint32_t *d_B, uint32_t n_inv,
+                              uint32_t total) {
+  uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= total)
+    return;
+  d_C[tid] = mont_mul(d_A[tid], d_B[tid], n_inv);
+}
 
-  uint32_t tid = threadIdx.x;
-  uint32_t base = blockIdx.x * (blockDim.x << 1);
+// ---- Transposición con shared memory (evita bank conflicts) ----
 
-  // Cargar a shared
-  s_A[tid] = d_A[base + tid];
-  s_A[tid + blockDim.x] = d_A[base + tid + blockDim.x];
+#define TILE 32
+
+__global__ void transpose(uint32_t *out, const uint32_t *in, uint32_t rows,
+                          uint32_t cols) {
+  __shared__ uint32_t tile[TILE][TILE + 1]; // +1 evita bank conflicts
+
+  uint32_t x = blockIdx.x * TILE + threadIdx.x; // col origen
+  uint32_t y = blockIdx.y * TILE + threadIdx.y; // fila origen
+
+  if (x < cols && y < rows)
+    tile[threadIdx.y][threadIdx.x] = in[y * cols + x];
 
   __syncthreads();
 
-  // Intra block (stages grandes)
-  for (uint32_t loop_stage = 0; loop_stage < 3; loop_stage++) {
+  // Escribir transpuesto: la columna x pasa a ser fila, fila y pasa a columna
+  x = blockIdx.y * TILE + threadIdx.x; // col destino
+  y = blockIdx.x * TILE + threadIdx.y; // fila destino
 
-    uint32_t stage = 7 - loop_stage;
-    uint32_t len = 1 << stage;
-
-    uint32_t j = tid & (len - 1);
-    uint32_t group = tid >> stage;
-    uint32_t pos = (group << (stage + 1)) + j;
-
-    uint32_t u = s_A[pos];
-    uint32_t v = s_A[pos + len];
-
-    uint32_t sum = u + v;
-    if (sum >= Q)
-      sum -= Q;
-
-    uint32_t diff = u + Q - v;
-    if (diff >= Q)
-      diff -= Q;
-
-    uint32_t w = twiddles_inv[stage_offsets[stage] + j];
-    uint32_t t = mont_mul(diff, w, n_inv);
-
-    s_A[pos] = sum;
-    s_A[pos + len] = t;
-
-    __syncthreads();
-  }
-
-  // Warp stages (stages pequeños)
-  for (uint32_t loop_stage = 3; loop_stage < 8; loop_stage++) {
-
-    uint32_t stage = 7 - loop_stage;
-    uint32_t len = 1 << stage;
-
-    uint32_t j = tid & (len - 1);
-    uint32_t group = tid >> stage;
-    uint32_t pos = (group << (stage + 1)) + j;
-
-    uint32_t u = s_A[pos];
-    uint32_t v = s_A[pos + len];
-
-    uint32_t sum = u + v;
-    if (sum >= Q)
-      sum -= Q;
-
-    uint32_t diff = u + Q - v;
-    if (diff >= Q)
-      diff -= Q;
-
-    uint32_t w = twiddles_inv[stage_offsets[stage] + j];
-    uint32_t t = mont_mul(diff, w, n_inv);
-
-    s_A[pos] = sum;
-    s_A[pos + len] = t;
-  }
-
-  __syncthreads();
-
-  // Escribir de regreso
-  d_A[base + tid] = s_A[tid];
-  d_A[base + tid + blockDim.x] = s_A[tid + blockDim.x];
+  if (x < rows && y < cols)
+    out[y * rows + x] = tile[threadIdx.x][threadIdx.y];
 }
 
-__global__ void intt_normalize_from_mont(uint32_t *d_A, uint32_t mont_n_inv,
-                                          uint32_t N_inv_mont) {
-    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= N_DEF) return;
+// ============================================================
+//  Estructuras de configuración NTT para una dimensión
+// ============================================================
 
-    // Sale de Montgomery, luego multiplica por N^{-1} (también en Mont.)
-    uint32_t val = mont_reduce((uint64_t)d_A[tid], mont_n_inv);
-    d_A[tid] = mont_mul(val, N_inv_mont, mont_n_inv);
-}
-
-int main() {
-
-  /* ------------------ Init ----------------- */
-
-  uint32_t A[N_DEF];
-
-  // Rellenar A con los datos de entrada
-  for (uint32_t i = 0; i < N_DEF; i++)
-    A[i] = i;
-
-  // Imprimir entrada de ejemplo
-  imprimir_arreglo(A, N_DEF);
-
-  // Precomputar twiddles
-  uint32_t n_inv = compute_n_inv(Q);
-  uint32_t R2 = (uint64_t)(R % Q) * (R % Q) % Q; // R^2 mod Q
-  uint32_t twiddles[MAX_TWIDDLES];
-  uint32_t twiddles_inv[MAX_TWIDDLES];
-  uint32_t total_stages = 0;
-  uint32_t tmp = N_DEF;
-  while (tmp > 1) {
-    total_stages++;
-    tmp >>= 1;
-  }
-  uint32_t *stage_offsets = (uint32_t *)malloc(sizeof(uint32_t) * total_stages);
-  precomputar_y_copiar_twiddles(stage_offsets, twiddles, twiddles_inv, R2, n_inv);
-
-  // Pasar los datos a memoria global del GPU
-  uint32_t *d_A;
-  uint32_t *d_twiddles, *d_twiddles_inv;
+struct NTTConfig {
+  uint32_t N;
+  uint32_t total_stages; // log2(N)
+  uint32_t n_inv;        // -Q^{-1} mod 2^32
+  uint32_t R2;           // R^2 mod Q (en forma estándar)
+  uint32_t *d_twiddles;
+  uint32_t *d_twiddles_inv;
   uint32_t *d_stage_offsets;
+};
 
-  cudaMalloc(&d_A, sizeof(uint32_t) * N_DEF);
-  cudaMalloc(&d_twiddles, sizeof(uint32_t) * MAX_TWIDDLES);
-  cudaMalloc(&d_twiddles_inv, sizeof(uint32_t) * MAX_TWIDDLES);
-  cudaMalloc(&d_stage_offsets, sizeof(uint32_t) * total_stages);
+static NTTConfig make_ntt_config(uint32_t N) {
+  NTTConfig cfg;
+  cfg.N = N;
 
-  cudaMemcpy(d_A, A, sizeof(uint32_t) * N_DEF, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_twiddles, twiddles, sizeof(uint32_t) * MAX_TWIDDLES,
+  cfg.total_stages = 0;
+  for (uint32_t tmp = N; tmp > 1; tmp >>= 1)
+    cfg.total_stages++;
+
+  cfg.n_inv = compute_n_inv(Q);
+  cfg.R2 = (uint32_t)((uint64_t)(R % Q) * (R % Q) % Q);
+
+  uint32_t max_twiddles = N - 1;
+  uint32_t *h_twiddles = (uint32_t *)malloc(sizeof(uint32_t) * max_twiddles);
+  uint32_t *h_twiddles_inv =
+      (uint32_t *)malloc(sizeof(uint32_t) * max_twiddles);
+  uint32_t *h_offsets = (uint32_t *)malloc(sizeof(uint32_t) * cfg.total_stages);
+
+  precompute_twiddles(N, h_offsets, h_twiddles, h_twiddles_inv, cfg.R2,
+                      cfg.n_inv);
+
+  cudaMalloc(&cfg.d_twiddles, sizeof(uint32_t) * max_twiddles);
+  cudaMalloc(&cfg.d_twiddles_inv, sizeof(uint32_t) * max_twiddles);
+  cudaMalloc(&cfg.d_stage_offsets, sizeof(uint32_t) * cfg.total_stages);
+
+  cudaMemcpy(cfg.d_twiddles, h_twiddles, sizeof(uint32_t) * max_twiddles,
              cudaMemcpyHostToDevice);
-  cudaMemcpy(d_twiddles_inv, twiddles_inv, sizeof(uint32_t) * MAX_TWIDDLES,
-             cudaMemcpyHostToDevice);
-  cudaMemcpy(d_stage_offsets, stage_offsets, sizeof(uint32_t) * total_stages,
-             cudaMemcpyHostToDevice);
+  cudaMemcpy(cfg.d_twiddles_inv, h_twiddles_inv,
+             sizeof(uint32_t) * max_twiddles, cudaMemcpyHostToDevice);
+  cudaMemcpy(cfg.d_stage_offsets, h_offsets,
+             sizeof(uint32_t) * cfg.total_stages, cudaMemcpyHostToDevice);
 
-  uint32_t threads = 256;
-  uint32_t pairs = N_DEF / 2;
-  uint32_t stage_blocks =
-      (pairs + threads - 1) / threads; // blocks = ceil(butterflies/threads)
-  uint32_t elems_per_block = threads * 2;
-  uint32_t blocks =
-      (N_DEF + elems_per_block - 1) / elems_per_block; // blocks = ceil(N/512)
+  free(h_twiddles);
+  free(h_twiddles_inv);
+  free(h_offsets);
+  return cfg;
+}
 
-  uint32_t norm_threads = 256;
-  uint32_t norm_blocks = (N_DEF + norm_threads - 1) / norm_threads;
+static void free_ntt_config(NTTConfig &cfg) {
+  cudaFree(cfg.d_twiddles);
+  cudaFree(cfg.d_twiddles_inv);
+  cudaFree(cfg.d_stage_offsets);
+}
 
-  // Medicion temporal
-  cudaEvent_t start, stop;
-  cudaEventCreate(&start);
-  cudaEventCreate(&stop);
-  cudaEventRecord(start);
+// ============================================================
+//  Bit-reversal permutation en GPU
+//  Cada thread intercambia el elemento tid con su bit-reversed j (si j > tid).
+//  blockIdx.y selecciona la fila dentro del batch.
+// ============================================================
 
-  /* ------------------ NTT ----------------- */
+__global__ void bit_reversal(uint32_t *d_A, uint32_t N, uint32_t log2N) {
+  uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  uint32_t base = blockIdx.y * N;
 
-  to_montgomery<<<norm_blocks, norm_threads>>>(d_A, R2, n_inv);
+  if (tid >= N)
+    return;
 
-  ntt_block<<<blocks, threads>>>(d_A, d_twiddles, d_stage_offsets, n_inv);
-
-  uint32_t stage = 8;
-  for (uint32_t len = 256; len < N_DEF; len <<= 1) {
-
-    ntt_stage<<<stage_blocks, threads>>>(d_A, d_twiddles, d_stage_offsets,
-                                         stage, len, n_inv);
-    stage++;
+  // Calcular índice bit-reversed de tid
+  uint32_t j = 0, x = tid;
+  for (uint32_t b = 0; b < log2N; b++) {
+    j = (j << 1) | (x & 1);
+    x >>= 1;
   }
 
-  cudaEventRecord(stop);
-  cudaEventSynchronize(stop);
+  // Intercambiar solo una vez
+  if (j > tid) {
+    uint32_t tmp = d_A[base + tid];
+    d_A[base + tid] = d_A[base + j];
+    d_A[base + j] = tmp;
+  }
+}
 
-  // Copiar los datos de salida del GPU al Host
-  cudaMemcpy(A, d_A, sizeof(uint32_t) * N_DEF, cudaMemcpyDeviceToHost);
+static void apply_bit_reversal(uint32_t *d_A, uint32_t N, uint32_t log2N,
+                               uint32_t count) {
+  const uint32_t threads = 256;
+  dim3 blks((N + threads - 1) / threads, count);
+  bit_reversal<<<blks, threads>>>(d_A, N, log2N);
+}
 
-  // Imprimir resultado de la NTT
-  imprimir_arreglo(A, N_DEF);
+// ============================================================
+//  Batch NTT: aplica NTT a `count` arreglos contiguos de longitud N
+//  Cada arreglo empieza en d_A + i * N
+// ============================================================
 
-  /* ------------------ INTT ----------------- */
+static void batch_ntt(uint32_t *d_A, const NTTConfig &cfg, uint32_t count,
+                      bool forward) {
+  const uint32_t N = cfg.N;
+  const uint32_t block_size = N >= 512 ? 256 : N / 2;
+  const uint32_t elems_per_blk = block_size * 2;
+  const uint32_t blks_per_row = (N + elems_per_blk - 1) / elems_per_blk;
+  const uint32_t stage_blks = (N / 2 + 255) / 256;
+  const uint32_t blk_stage_lim = N >= 512 ? 9u : cfg.total_stages;
+  const uint32_t first_ext_len = N >= 512 ? 512u : N;
 
-  stage = total_stages - 1;
-  for (uint32_t len = N_DEF >> 1; len >= 256; len >>= 1, stage--) {
-    intt_stage<<<stage_blocks, threads>>>(d_A, d_twiddles_inv, d_stage_offsets,
-                                          stage, len, n_inv);
+  if (forward) {
+    // Bit-reversal sobre todas las filas del batch de una sola vez
+    apply_bit_reversal(d_A, N, cfg.total_stages, count);
+
+    for (uint32_t i = 0; i < count; i++) {
+      uint32_t *ptr = d_A + i * N;
+      ntt_block<<<blks_per_row, block_size>>>(ptr, cfg.d_twiddles,
+                                              cfg.d_stage_offsets, cfg.n_inv,
+                                              cfg.total_stages);
+      uint32_t stage = blk_stage_lim;
+      for (uint32_t len = first_ext_len; len < N; len <<= 1, stage++)
+        ntt_stage<<<stage_blks, 256>>>(ptr, cfg.d_twiddles, cfg.d_stage_offsets,
+                                       stage, len, cfg.n_inv, N);
+    }
+  } else {
+    for (uint32_t i = 0; i < count; i++) {
+      uint32_t *ptr = d_A + i * N;
+      uint32_t stage = cfg.total_stages - 1;
+      for (uint32_t len = N >> 1; len >= first_ext_len; len >>= 1, stage--)
+        intt_stage<<<stage_blks, 256>>>(ptr, cfg.d_twiddles_inv,
+                                        cfg.d_stage_offsets, stage, len,
+                                        cfg.n_inv, N);
+      intt_block<<<blks_per_row, block_size>>>(ptr, cfg.d_twiddles_inv,
+                                               cfg.d_stage_offsets, cfg.n_inv,
+                                               cfg.total_stages);
+    }
+    // Bit-reversal al final de la INTT (deshace el reordenamiento)
+    apply_bit_reversal(d_A, N, cfg.total_stages, count);
+  }
+}
+
+// ============================================================
+//  NTT 2D: filas → transponer → filas (= columnas) y viceversa
+// ============================================================
+
+static void ntt2d(uint32_t *d_A, uint32_t *d_tmp, const NTTConfig &cfg_x,
+                  const NTTConfig &cfg_y, bool forward) {
+
+  dim3 tile_threads(TILE, TILE);
+
+  if (forward) {
+    // 1. Convertir a Montgomery
+    uint32_t total = NX * NY;
+    uint32_t blks = (total + 255) / 256;
+    to_montgomery<<<blks, 256>>>(d_A, cfg_x.R2, cfg_x.n_inv, total);
+
+    // 2. NTT por filas: NY filas de longitud NX
+    //    Después: d_A[ky * NX + kx_index]  (aun en layout filas)
+    batch_ntt(d_A, cfg_x, NY, true);
+
+    // 3. Transponer [NY x NX] → [NX x NY]
+    //    Ahora la fila i corresponde a la columna original i
+    dim3 blks_t((NX + TILE - 1) / TILE, (NY + TILE - 1) / TILE);
+    transpose<<<blks_t, tile_threads>>>(d_tmp, d_A, NY, NX);
+    cudaMemcpy(d_A, d_tmp, sizeof(uint32_t) * NX * NY,
+               cudaMemcpyDeviceToDevice);
+
+    // 4. NTT por columnas: NX "filas" (que son columnas originales) de longitud
+    // NY
+    //    Al terminar d_A queda en layout transpuesto [NX x NY]:
+    //    d_A[kx * NY + ky]
+    batch_ntt(d_A, cfg_y, NX, true);
+
+  } else {
+    // INTT: d_A llega en layout [NX x NY] = d_A[kx*NY + ky]
+
+    // 1. INTT por columnas (son filas en el layout actual)
+    batch_ntt(d_A, cfg_y, NX, false);
+
+    // 2. Transponer [NX x NY] → [NY x NX] para recuperar layout de filas
+    dim3 blks_t((NY + TILE - 1) / TILE, (NX + TILE - 1) / TILE);
+    transpose<<<blks_t, tile_threads>>>(d_tmp, d_A, NX, NY);
+    cudaMemcpy(d_A, d_tmp, sizeof(uint32_t) * NX * NY,
+               cudaMemcpyDeviceToDevice);
+
+    // 3. INTT por filas
+    batch_ntt(d_A, cfg_x, NY, false);
+
+    // 4. Normalizar: dividir por NX*NY
+    uint32_t NXY = NX * NY;
+    uint32_t N_inv = power(NXY % Q, Q - 2, Q);
+    uint32_t n_inv = cfg_x.n_inv;
+    uint32_t R2 = cfg_x.R2;
+    uint32_t N_inv_mont = mont_mul(N_inv, R2, n_inv);
+
+    uint32_t blks = (NXY + 255) / 256;
+    intt_normalize<<<blks, 256>>>(d_A, n_inv, N_inv_mont, NXY);
+  }
+}
+
+// ============================================================
+//  Multiplicación de polinomios bivariables
+//  A(x,y) * B(x,y) mod (x^NX - 1, y^NY - 1)
+// ============================================================
+
+void poly2d_mul(uint32_t *d_A, uint32_t *d_B, uint32_t *d_C, uint32_t *d_tmp,
+                const NTTConfig &cfg_x, const NTTConfig &cfg_y) {
+
+  uint32_t total = NX * NY;
+  uint32_t n_inv = cfg_x.n_inv;
+
+  // Transformar A y B al dominio frecuencial 2D
+  ntt2d(d_A, d_tmp, cfg_x, cfg_y, true);
+  ntt2d(d_B, d_tmp, cfg_x, cfg_y, true);
+
+  // Multiplicación puntual: C = A * B (ambos ya en Montgomery)
+  uint32_t blks = (total + 255) / 256;
+  pointwise_mul<<<blks, 256>>>(d_C, d_A, d_B, n_inv, total);
+
+  // Transformar C de vuelta al dominio polinomial
+  ntt2d(d_C, d_tmp, cfg_x, cfg_y, false);
+}
+
+// ============================================================
+//  Main de demostración
+// ============================================================
+
+int main_demo() {
+  printf("NTT 2D: multiplicación de polinomios bivariables\n");
+  printf("Dimensiones: NX=%u, NY=%u, Q=%u\n\n", NX, NY, Q);
+
+  // Verificar que Q-1 sea divisible por NX y NY (condición NTT)
+  if ((Q - 1) % NX != 0 || (Q - 1) % NY != 0) {
+    printf("Error: Q-1 no es divisible por NX o NY. "
+           "Elige un primo NTT-friendly.\n");
+    return 1;
   }
 
-  intt_block<<<stage_blocks, threads>>>(d_A, d_twiddles_inv, d_stage_offsets, n_inv);
+  uint32_t total = NX * NY;
 
-  // Normalizar intt
-  uint32_t N_inv = power(N_DEF, Q - 2, Q);
-  uint32_t N_inv_mont = mont_mul(N_inv, R2, n_inv);
-  intt_normalize_from_mont<<<norm_blocks, norm_threads>>>(d_A, n_inv, N_inv_mont);
+  // Inicializar polinomios de prueba en host
+  uint32_t *h_A = (uint32_t *)malloc(sizeof(uint32_t) * total);
+  uint32_t *h_B = (uint32_t *)malloc(sizeof(uint32_t) * total);
+  uint32_t *h_C = (uint32_t *)malloc(sizeof(uint32_t) * total);
 
-  // Copiar los datos de salida del GPU al Host
-  cudaMemcpy(A, d_A, sizeof(uint32_t) * N_DEF, cudaMemcpyDeviceToHost);
+  for (uint32_t i = 0; i < total; i++) {
+    h_A[i] = i % Q;
+    h_B[i] = (total - i) % Q;
+  }
 
-  // Imprimir resultado de la INTT
-  imprimir_arreglo(A, N_DEF);
+  print_array("A (entrada)", h_A, NY, NX);
+  print_array("B (entrada)", h_B, NY, NX);
 
-  /* ------------------ Mediciones ----------------- */
+  // Alojar memoria en GPU
+  uint32_t *d_A, *d_B, *d_C, *d_tmp;
+  cudaMalloc(&d_A, sizeof(uint32_t) * total);
+  cudaMalloc(&d_B, sizeof(uint32_t) * total);
+  cudaMalloc(&d_C, sizeof(uint32_t) * total);
+  cudaMalloc(&d_tmp, sizeof(uint32_t) * total); // buffer para transponer
+
+  cudaMemcpy(d_A, h_A, sizeof(uint32_t) * total, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_B, h_B, sizeof(uint32_t) * total, cudaMemcpyHostToDevice);
+
+  // Precomputar configuraciones NTT para cada dimensión
+  NTTConfig cfg_x = make_ntt_config(NX);
+  NTTConfig cfg_y = make_ntt_config(NY);
+
+  // Medición de tiempo
+  cudaEvent_t ev_start, ev_stop;
+  cudaEventCreate(&ev_start);
+  cudaEventCreate(&ev_stop);
+  cudaEventRecord(ev_start);
+
+  // ---- Multiplicación ----
+  poly2d_mul(d_A, d_B, d_C, d_tmp, cfg_x, cfg_y);
+
+  cudaEventRecord(ev_stop);
+  cudaEventSynchronize(ev_stop);
+
+  // Copiar resultado al host
+  cudaMemcpy(h_C, d_C, sizeof(uint32_t) * total, cudaMemcpyDeviceToHost);
+  print_array("C = A*B (resultado)", h_C, NY, NX);
 
   float ms = 0.0f;
-  cudaEventElapsedTime(&ms, start, stop);
-  printf("La NTT tardó: %f ms\n", ms);
+  cudaEventElapsedTime(&ms, ev_start, ev_stop);
+  printf("Tiempo total (NTT2D + mul + INTT2D): %.3f ms\n", ms);
 
-  free(stage_offsets);
+  // Liberar recursos
+  free_ntt_config(cfg_x);
+  free_ntt_config(cfg_y);
+  free(h_A);
+  free(h_B);
+  free(h_C);
   cudaFree(d_A);
-  cudaFree(d_twiddles);
-  cudaFree(d_twiddles_inv);
-  cudaFree(d_stage_offsets);
-  cudaEventDestroy(start);
-  cudaEventDestroy(stop);
+  cudaFree(d_B);
+  cudaFree(d_C);
+  cudaFree(d_tmp);
+  cudaEventDestroy(ev_start);
+  cudaEventDestroy(ev_stop);
+
+  return 0;
 }
