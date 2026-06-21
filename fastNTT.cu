@@ -1,4 +1,3 @@
-// ntt2d.cu
 // NTT 2D para multiplicación de polinomios bivariables A(x,y) * B(x,y)
 // Estrategia: NTT separable por filas y columnas (Cooley-Tukey 2D)
 //
@@ -17,6 +16,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+#define CEILING(NUM,DEN) ((NUM + DEN - 1)/DEN)
 
 // ============================================================
 //  Configuración: dimensiones y primo
@@ -86,7 +87,6 @@ static void print_array(const char *label, uint32_t *A, uint32_t rows,
 
 // ============================================================
 //  Precomputo de twiddles para una longitud N dada
-//  Misma lógica que antes, parametrizada
 // ============================================================
 
 static void precompute_twiddles(uint32_t N, uint32_t *stage_offsets,
@@ -430,7 +430,8 @@ __global__ void bit_reversal(uint32_t *d_A, uint32_t N, uint32_t log2N) {
 static void apply_bit_reversal(uint32_t *d_A, uint32_t N, uint32_t log2N,
                                uint32_t count) {
   const uint32_t threads = 256;
-  dim3 blks((N + threads - 1) / threads, count);
+  uint32_t ceilingXBlocks = CEILING(N, threads);// (N + threads - 1) / threads; // N/256
+  dim3 blks(ceilingXBlocks, count);
   bit_reversal<<<blks, threads>>>(d_A, N, log2N);
 }
 
@@ -444,7 +445,7 @@ static void batch_ntt(uint32_t *d_A, const NTTConfig &cfg, uint32_t count,
   const uint32_t N = cfg.N;
   const uint32_t block_size = N >= 512 ? 256 : N / 2;
   const uint32_t elems_per_blk = block_size * 2;
-  const uint32_t blks_per_row = (N + elems_per_blk - 1) / elems_per_blk;
+  const uint32_t blks_per_row = CEILING(N, elems_per_blk); // (N + elems_per_blk - 1) / elems_per_blk;
   const uint32_t stage_blks = (N / 2 + 255) / 256;
   const uint32_t blk_stage_lim = N >= 512 ? 9u : cfg.total_stages;
   const uint32_t first_ext_len = N >= 512 ? 512u : N;
@@ -458,6 +459,7 @@ static void batch_ntt(uint32_t *d_A, const NTTConfig &cfg, uint32_t count,
       ntt_block<<<blks_per_row, block_size>>>(ptr, cfg.d_twiddles,
                                               cfg.d_stage_offsets, cfg.n_inv,
                                               cfg.total_stages);
+
       uint32_t stage = blk_stage_lim;
       for (uint32_t len = first_ext_len; len < N; len <<= 1, stage++)
         ntt_stage<<<stage_blks, 256>>>(ptr, cfg.d_twiddles, cfg.d_stage_offsets,
@@ -471,6 +473,7 @@ static void batch_ntt(uint32_t *d_A, const NTTConfig &cfg, uint32_t count,
         intt_stage<<<stage_blks, 256>>>(ptr, cfg.d_twiddles_inv,
                                         cfg.d_stage_offsets, stage, len,
                                         cfg.n_inv, N);
+
       intt_block<<<blks_per_row, block_size>>>(ptr, cfg.d_twiddles_inv,
                                                cfg.d_stage_offsets, cfg.n_inv,
                                                cfg.total_stages);
@@ -492,7 +495,7 @@ static void ntt2d(uint32_t *d_A, uint32_t *d_tmp, const NTTConfig &cfg_x,
   if (forward) {
     // 1. Convertir a Montgomery
     uint32_t total = NX * NY;
-    uint32_t blks = (total + 255) / 256;
+    uint32_t blks = CEILING(total,256); // (total + 255) / 256;
     to_montgomery<<<blks, 256>>>(d_A, cfg_x.R2, cfg_x.n_inv, total);
 
     // 2. NTT por filas: NY filas de longitud NX
@@ -501,9 +504,9 @@ static void ntt2d(uint32_t *d_A, uint32_t *d_tmp, const NTTConfig &cfg_x,
 
     // 3. Transponer [NY x NX] → [NX x NY]
     //    Ahora la fila i corresponde a la columna original i
-    dim3 blks_t((NX + TILE - 1) / TILE, (NY + TILE - 1) / TILE);
+    dim3 blks_t(CEILING(NX,TILE), CEILING(NY,TILE));
     transpose<<<blks_t, tile_threads>>>(d_tmp, d_A, NY, NX);
-    cudaMemcpy(d_A, d_tmp, sizeof(uint32_t) * NX * NY,
+    cudaMemcpy(d_A, d_tmp, sizeof(uint32_t) * total,
                cudaMemcpyDeviceToDevice);
 
     // 4. NTT por columnas: NX "filas" (que son columnas originales) de longitud
@@ -513,13 +516,13 @@ static void ntt2d(uint32_t *d_A, uint32_t *d_tmp, const NTTConfig &cfg_x,
     batch_ntt(d_A, cfg_y, NX, true);
 
   } else {
-    // INTT: d_A llega en layout [NX x NY] = d_A[kx*NY + ky]
+    // INTT: d_A llega en layout [NX x NY] = d_A[kx * NY + ky]
 
     // 1. INTT por columnas (son filas en el layout actual)
     batch_ntt(d_A, cfg_y, NX, false);
 
     // 2. Transponer [NX x NY] → [NY x NX] para recuperar layout de filas
-    dim3 blks_t((NY + TILE - 1) / TILE, (NX + TILE - 1) / TILE);
+    dim3 blks_t(CEILING(NY,TILE), CEILING(NX,TILE));
     transpose<<<blks_t, tile_threads>>>(d_tmp, d_A, NX, NY);
     cudaMemcpy(d_A, d_tmp, sizeof(uint32_t) * NX * NY,
                cudaMemcpyDeviceToDevice);
@@ -527,14 +530,14 @@ static void ntt2d(uint32_t *d_A, uint32_t *d_tmp, const NTTConfig &cfg_x,
     // 3. INTT por filas
     batch_ntt(d_A, cfg_x, NY, false);
 
-    // 4. Normalizar: dividir por NX*NY
+    // 4. Normalizar
     uint32_t NXY = NX * NY;
     uint32_t N_inv = power(NXY % Q, Q - 2, Q);
     uint32_t n_inv = cfg_x.n_inv;
     uint32_t R2 = cfg_x.R2;
     uint32_t N_inv_mont = mont_mul(N_inv, R2, n_inv);
 
-    uint32_t blks = (NXY + 255) / 256;
+    uint32_t blks = CEILING(NXY, 256); // (NXY + 255) / 256;
     intt_normalize<<<blks, 256>>>(d_A, n_inv, N_inv_mont, NXY);
   }
 }
@@ -555,7 +558,7 @@ void poly2d_mul(uint32_t *d_A, uint32_t *d_B, uint32_t *d_C, uint32_t *d_tmp,
   ntt2d(d_B, d_tmp, cfg_x, cfg_y, true);
 
   // Multiplicación puntual: C = A * B (ambos ya en Montgomery)
-  uint32_t blks = (total + 255) / 256;
+  uint32_t blks =  CEILING(total, 256); //(total + 255) / 256;
   pointwise_mul<<<blks, 256>>>(d_C, d_A, d_B, n_inv, total);
 
   // Transformar C de vuelta al dominio polinomial
@@ -572,8 +575,7 @@ int main_demo() {
 
   // Verificar que Q-1 sea divisible por NX y NY (condición NTT)
   if ((Q - 1) % NX != 0 || (Q - 1) % NY != 0) {
-    printf("Error: Q-1 no es divisible por NX o NY. "
-           "Elige un primo NTT-friendly.\n");
+    printf("Error: Q-1 no es divisible por NX o NY.\n");
     return 1;
   }
 
